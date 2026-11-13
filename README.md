@@ -4,6 +4,8 @@
 qué consultas tardan más y por qué, uso de índices, bloqueos, estado general, gráficos en el tiempo
 y generación de SQL de optimización (crear/eliminar índices, estadísticas, VACUUM…).
 
+![Tyrux: sección de gráficos](docs/images/charts-light.png)
+
 > La herramienta es de **solo lectura**: nunca ejecuta cambios en tu base de datos. Solo genera el
 > script SQL para que lo revises y lo apliques tú.
 
@@ -54,6 +56,18 @@ Conexiones de ejemplo dentro de la red de compose:
   bloqueos y parámetros de configuración.
 - **Optimización**: recomendaciones por severidad (índices faltantes, sin uso, duplicados,
   estadísticas obsoletas, bloat, configuración) → script SQL para copiar o descargar.
+
+## Capturas
+
+| Plan de ejecución y «por qué tarda» | Top consultas (Oracle) |
+|---|---|
+| ![Explain con hallazgos](docs/images/explain.png) | ![Top consultas Oracle](docs/images/oracle-top.png) |
+| **Recomendaciones de optimización** | **Script SQL generado** |
+| ![Recomendaciones](docs/images/optimize.png) | ![Script SQL](docs/images/optimize-script.png) |
+| **Índices sin uso y duplicados** | **Tema oscuro** |
+| ![Índices](docs/images/technical-indexes.png) | ![Gráficos en tema oscuro](docs/images/charts-dark.png) |
+
+📖 Documentación completa en la **[Wiki](https://github.com/franmen05/tyrux/wiki)**.
 
 ## Permisos necesarios del usuario de conexión
 
