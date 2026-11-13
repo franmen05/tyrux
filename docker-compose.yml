@@ -1,0 +1,100 @@
+# docker compose up -d                                  -> app only (http://localhost:8080)
+# docker compose --profile demo-postgres up -d          -> + demo Postgres (host port 55432)
+# docker compose --profile demo-oracle up -d            -> + demo Oracle Free (host port 1521)
+# docker compose --profile workload-pg up -d            -> demo Postgres + load generator
+# docker compose --profile workload up -d               -> both demo DBs + both load generators
+services:
+  dbmon:
+    build: .
+    image: dbmon:latest
+    ports:
+      - "${DBMON_PORT:-8080}:8080"
+    volumes:
+      - dbmon-data:/data
+    environment:
+      DBMON_SECRET_KEY: ${DBMON_SECRET_KEY:-}
+      DBMON_RETENTION_HOURS: ${DBMON_RETENTION_HOURS:-24}
+    extra_hosts:
+      - "host.docker.internal:host-gateway"   # reach DBs on the host machine (Linux)
+    restart: unless-stopped
+
+  demo-postgres:
+    profiles: ["demo-postgres", "workload", "workload-pg"]
+    image: postgres:17
+    container_name: dbmon-demo-pg
+    environment:
+      POSTGRES_USER: dbmon
+      POSTGRES_PASSWORD: dbmon
+      POSTGRES_DB: shop
+    command: >
+      postgres
+      -c shared_preload_libraries=pg_stat_statements
+      -c pg_stat_statements.track=all
+      -c track_io_timing=on
+    volumes:
+      - ./docker/postgres-demo:/docker-entrypoint-initdb.d:ro
+    ports:
+      - "${DEMO_PG_PORT:-55432}:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U dbmon -d shop"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+
+  demo-oracle:
+    profiles: ["demo-oracle", "workload", "workload-oracle"]
+    image: gvenzl/oracle-free:23-slim-faststart
+    container_name: dbmon-demo-oracle
+    environment:
+      ORACLE_PASSWORD: dbmon
+      APP_USER: shop
+      APP_USER_PASSWORD: shop
+    volumes:
+      - ./docker/oracle-demo:/container-entrypoint-initdb.d:ro
+    ports:
+      - "${DEMO_ORA_PORT:-1521}:1521"
+    healthcheck:
+      test: ["CMD", "healthcheck.sh"]
+      interval: 10s
+      timeout: 5s
+      retries: 30
+      start_period: 30s
+
+  workload-pg:
+    profiles: ["workload", "workload-pg"]
+    image: dbmon:latest
+    build: .
+    entrypoint: ["python", "/workload/pg_workload.py"]
+    volumes:
+      - ./docker/workload:/workload:ro
+    environment:
+      PGHOST: demo-postgres
+      PGPORT: "5432"
+      PGUSER: dbmon
+      PGPASSWORD: dbmon
+      PGDATABASE: shop
+    depends_on:
+      demo-postgres:
+        condition: service_healthy
+    restart: unless-stopped
+
+  workload-oracle:
+    profiles: ["workload", "workload-oracle"]
+    image: dbmon:latest
+    build: .
+    entrypoint: ["python", "/workload/ora_workload.py"]
+    volumes:
+      - ./docker/workload:/workload:ro
+    environment:
+      ORA_HOST: demo-oracle
+      ORA_PORT: "1521"
+      ORA_SERVICE: FREEPDB1
+      ORA_USER: shop
+      ORA_PASSWORD: shop
+    depends_on:
+      demo-oracle:
+        condition: service_healthy
+    restart: unless-stopped
+
+volumes:
+  dbmon-data:

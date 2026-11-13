@@ -1,0 +1,14 @@
+{
+  "name": "dbmon-e2e",
+  "private": true,
+  "version": "1.0.0",
+  "scripts": {
+    "test": "playwright test",
+    "test:oracle": "E2E_ORACLE=1 playwright test tests/oracle.spec.ts",
+    "report": "playwright show-report"
+  },
+  "devDependencies": {
+    "@playwright/test": "1.57.0",
+    "@types/node": "^22.0.0"
+  }
+}
