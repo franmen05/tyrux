@@ -15,7 +15,7 @@ y generación de SQL de optimización (crear/eliminar índices, estadísticas, V
 docker compose up -d --build
 ```
 
-Abre http://localhost:8080, ve a **Conexiones → Nueva conexión**, prueba y guarda.
+Abre http://localhost:8080, ve a **Conexiones → Agregar conexión**, prueba y guarda.
 
 Variables útiles (en el entorno o en un `.env` junto al compose):
 
