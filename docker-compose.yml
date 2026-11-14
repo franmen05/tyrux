@@ -14,6 +14,7 @@ services:
     environment:
       DBMON_SECRET_KEY: ${DBMON_SECRET_KEY:-}
       DBMON_RETENTION_HOURS: ${DBMON_RETENTION_HOURS:-24}
+      DBMON_ORACLE_MODE: ${DBMON_ORACLE_MODE:-auto}
     extra_hosts:
       - "host.docker.internal:host-gateway"   # reach DBs on the host machine (Linux)
     restart: unless-stopped

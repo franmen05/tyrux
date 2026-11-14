@@ -5,7 +5,7 @@ Navegador ──HTTP──▶ Tyrux (un contenedor)
                     ├── Frontend: React + Vite (servido como estático)
                     ├── API: FastAPI  /api/...
                     │     ├── Colector PostgreSQL (psycopg 3)
-                    │     ├── Colector Oracle (python-oracledb, modo thin)
+                    │     ├── Colector Oracle (python-oracledb, thick con Instant Client / thin)
                     │     └── Muestreador asíncrono (monitoreo continuo)
                     └── SQLite (WAL) en /data: conexiones cifradas + historial
                                 │

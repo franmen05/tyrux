@@ -170,6 +170,27 @@ def _orders_by_customer_sql_id(coll) -> str:
 
 
 @pytest.mark.integration
+class TestErrorMessages:
+    @staticmethod
+    def _err(full_code: str, text: str) -> Exception:
+        class _E:  # mimics oracledb's _Error (exposes .full_code)
+            def __init__(self):
+                self.full_code = full_code
+
+            def __str__(self):
+                return text
+        return Exception(_E())
+
+    def test_dpy_3015_10g_verifier_explains_fixes(self):
+        cfg = ConnectionConfig(engine="oracle", host="h", port=1521, database="SVC",
+                               username="app_user", password="x")
+        msg = OracleCollector(cfg)._message(self._err(
+            "DPY-3015", "DPY-3015: password verifier type 0x939 is not supported by python-oracledb in thin mode"))
+        assert "DPY-3015" in msg and "10G" in msg
+        assert "Instant Client" in msg and "DBMON_ORACLE_CLIENT_LIB_DIR" in msg
+        assert "ALTER USER APP_USER IDENTIFIED BY" in msg
+
+
 class TestOracleLive:
     def test_connection_ok(self, coll):
         r = coll.test_connection()
@@ -256,6 +277,9 @@ class TestOracleLive:
 
     def test_explain_pasted_sql_with_binds(self, coll):
         e = coll.explain(ExplainRequest(sql="SELECT * FROM shop.orders WHERE customer_id = :c"))
+        assert "ORDERS" in e.plan_text
+        e = coll.explain(ExplainRequest(
+            sql="SELECT * FROM shop.orders WHERE customer_id = :1 AND status = :2"))
         assert "ORDERS" in e.plan_text
 
     def test_explain_cartesian(self, coll):

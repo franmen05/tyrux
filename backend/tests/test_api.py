@@ -31,7 +31,8 @@ def conn_id(client):
 
 
 def test_health(client):
-    assert client.get("/api/health").json() == {"status": "ok"}
+    body = client.get("/api/health").json()
+    assert body["status"] == "ok" and body["oracle_mode"] in ("thin", "thick")
     assert client.get("/api/nope").status_code == 404
 
 

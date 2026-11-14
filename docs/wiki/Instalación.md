@@ -25,6 +25,8 @@ Se pueden poner en el entorno o en un archivo `.env` junto a `docker-compose.yml
 | `DBMON_SECRET_KEY` | autogenerada | Clave Fernet para cifrar las contraseñas guardadas. Si no se define, se genera una y se guarda en el volumen |
 | `DBMON_RETENTION_HOURS` | `24` | Horas de historial de métricas que se conservan |
 | `DBMON_LOG_LEVEL` | `INFO` | Nivel de log del backend |
+| `DBMON_ORACLE_MODE` | `auto` | Modo de python-oracledb. `auto`: *thick* si se puede cargar Oracle Instant Client (la imagen Docker lo incluye), si no *thin*. `thick` / `thin` lo fuerzan |
+| `DBMON_ORACLE_CLIENT_LIB_DIR` | `/opt/oracle/instantclient` (imagen) | Carpeta de Oracle Instant Client. Fuera de Docker, defínela si quieres el modo *thick* |
 | `DEMO_PG_PORT` / `DEMO_ORA_PORT` | `55432` / `1521` | Puertos del host para las bases demo |
 
 Si el puerto 8080 está ocupado:

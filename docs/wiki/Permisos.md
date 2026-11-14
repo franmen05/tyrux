@@ -30,5 +30,5 @@ GRANT CREATE SESSION, SELECT_CATALOG_ROLE TO tyrux;
 ```
 
 - No usa AWR ni ASH, así que **no requiere el Diagnostics Pack**.
-- La conexión usa el modo *thin* de python-oracledb: no hace falta Oracle Instant Client.
+- La imagen Docker incluye Oracle Instant Client y usa el modo *thick* de python-oracledb, que admite también usuarios con contraseñas antiguas (verificador 10G). Fuera de Docker, sin Instant Client, usa el modo *thin*, que no necesita nada instalado. El modo activo se ve en `GET /api/health` (`oracle_mode`).
 - Si alguna vista del diccionario no es accesible, Tyrux lo indica como recomendación informativa y sigue con el resto.
