@@ -1,4 +1,5 @@
-"""Oracle collector (12.2+, incl. 23ai Free) using python-oracledb in THIN mode.
+"""Oracle collector (12.2+, incl. 23ai Free) using python-oracledb (thin mode, or thick mode when
+Oracle Instant Client is available: see app/oracle_client.py).
 
 Read-only: only V$ / DBA_ views are queried (no AWR/ASH, no DBMS_SQLTUNE, i.e. no Diagnostics or
 Tuning Pack). The only writes are:
@@ -22,6 +23,7 @@ from typing import Any, Callable, Iterable, Optional
 
 import oracledb
 
+from app import oracle_client
 from app.collectors.base import Collector, CollectorError, OrderBy
 from app.schemas import (
     ActiveQuery, ConfigParam, ConnectionConfig, ExplainRequest, ExplainResult, Finding, IndexStat,
@@ -342,6 +344,7 @@ class OracleCollector(Collector):
 
     def _connect(self) -> oracledb.Connection:
         opts = self.cfg.options or {}
+        oracle_client.ensure_mode()
         try:
             conn = oracledb.connect(
                 user=self.cfg.username, password=self.cfg.password, dsn=self._dsn(),
@@ -410,6 +413,8 @@ class OracleCollector(Collector):
         where = f"{self.cfg.host}:{self.cfg.port}/{self.cfg.database}"
         if code == "ORA-01017":
             return "Usuario o contraseña de Oracle incorrectos (ORA-01017)."
+        if code == "DPY-3015":
+            return self._verifier_10g_message()
         if code == "ORA-28000":
             return "La cuenta de Oracle está bloqueada (ORA-28000)."
         if code == "ORA-28001":
@@ -425,6 +430,20 @@ class OracleCollector(Collector):
         if code == "DPY-4024" or "ORA-01013" in raw:
             return f"La consulta superó el tiempo límite de {CALL_TIMEOUT_MS // 1000} s y se canceló."
         return f"Error de Oracle: {raw}"
+
+    def _verifier_10g_message(self) -> str:
+        user = self.cfg.username or "<usuario>"
+        why = oracle_client.thick_error()
+        loaded = f" No se pudo cargar Oracle Instant Client: {why}." if why else ""
+        return (
+            f"El usuario '{user}' tiene una contraseña con el verificador antiguo 10G, que el modo thin "
+            "de python-oracledb no admite (DPY-3015)." + loaded + " Soluciones: "
+            "(1) ejecutar Tyrux con Oracle Instant Client (modo thick): la imagen Docker ya lo incluye; "
+            "en local instálelo y defina DBMON_ORACLE_CLIENT_LIB_DIR con su carpeta; "
+            "(2) o que el DBA regenere la contraseña con un verificador moderno: con "
+            "sec_case_sensitive_logon = TRUE, ejecutar "
+            f"ALTER USER {q(user.upper())} IDENTIFIED BY <contraseña>;"
+        )
 
     # ------------------------------------------------------------------ query helpers
     @staticmethod
@@ -738,12 +757,14 @@ class OracleCollector(Collector):
         stmt_id = "dbmon_" + uuid.uuid4().hex[:20]
         try:
             with conn.cursor() as cur:
-                # EXPLAIN PLAN never executes the statement, but the driver still wants a value for
-                # every placeholder (:x / :1): bind NULLs, Oracle ignores them for the plan.
-                names = bind_names(sql)
+                # EXPLAIN PLAN never executes the statement. Thin mode still wants a value for every
+                # placeholder (:x / :1) while thick mode (OCI) exposes none, so ask the driver which
+                # ones it expects and bind NULLs to them; Oracle ignores the values for the plan.
+                cur.prepare(f"EXPLAIN PLAN SET STATEMENT_ID = '{stmt_id}' FOR {sql}")
+                names = cur.bindnames()
                 binds: Any = [None] * len(names) if names and all(n.isdigit() for n in names) \
                     else {n: None for n in names}
-                cur.execute(f"EXPLAIN PLAN SET STATEMENT_ID = '{stmt_id}' FOR {sql}", binds)
+                cur.execute(None, binds)
             rows = self._rows(conn, f"SELECT {self._PLAN_COLS} FROM plan_table "
                                     "WHERE statement_id = :s ORDER BY id", {"s": stmt_id})
             out = self._rows(conn, "SELECT plan_table_output FROM "

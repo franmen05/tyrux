@@ -9,6 +9,7 @@ from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse
 
+from app import oracle_client
 from app.api import connections, diagnostics, monitor, optimize
 from app.sampler import manager
 
@@ -19,6 +20,7 @@ DEFAULT_STATIC = Path(__file__).resolve().parents[2] / "frontend" / "dist"
 
 @asynccontextmanager
 async def lifespan(_: FastAPI):
+    oracle_client.ensure_mode()   # thin/thick is process-wide: fix it before any connection
     await manager.startup()
     try:
         yield
@@ -40,7 +42,7 @@ for module in (connections, diagnostics, monitor, optimize):
 
 @app.get("/api/health")
 async def health():
-    return {"status": "ok"}
+    return {"status": "ok", "oracle_mode": oracle_client.mode_label()}
 
 
 @app.api_route("/api/{rest:path}", methods=["GET", "POST", "PUT", "DELETE", "PATCH"],

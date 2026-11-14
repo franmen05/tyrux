@@ -24,6 +24,7 @@ Variables útiles (en el entorno o en un `.env` junto al compose):
 | `DBMON_PORT` | `8080` | Puerto del host para la UI |
 | `DBMON_SECRET_KEY` | (autogenerada en el volumen) | Clave Fernet para cifrar contraseñas guardadas |
 | `DBMON_RETENTION_HOURS` | `24` | Horas de historial de métricas |
+| `DBMON_ORACLE_MODE` | `auto` | Modo de python-oracledb: `auto` (thick si hay Oracle Instant Client, incluido en la imagen), `thick` o `thin` |
 | `DEMO_PG_PORT` / `DEMO_ORA_PORT` | `55432` / `1521` | Puertos de las bases demo |
 
 Si el puerto 8080 está ocupado: `DBMON_PORT=8099 docker compose up -d`.

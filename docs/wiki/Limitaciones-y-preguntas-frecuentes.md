@@ -25,5 +25,13 @@ Falta `pg_stat_statements` o el usuario no tiene `pg_monitor`. Ver [[Permisos]].
 **Las contraseñas guardadas dejaron de funcionar tras reinstalar.**
 Se perdió la clave de cifrado del volumen. Define `DBMON_SECRET_KEY` fija y vuelve a guardar las contraseñas.
 
+**Oracle: `DPY-3015: password verifier type 0x939 is not supported by python-oracledb in thin mode`.**
+El usuario de Oracle tiene la contraseña guardada solo con el verificador antiguo 10G, que el modo *thin* no admite. Soluciones:
+- Usa la imagen Docker de Tyrux: incluye Oracle Instant Client y se conecta en modo *thick*, que sí lo admite. Si ejecutas el backend fuera de Docker, instala [Oracle Instant Client](https://www.oracle.com/database/technologies/instant-client.html) y define `DBMON_ORACLE_CLIENT_LIB_DIR` con su carpeta.
+- O pide al DBA que regenere la contraseña con un verificador moderno: comprobar que `sec_case_sensitive_logon` no sea `FALSE` (hasta 19c) y ejecutar `ALTER USER <usuario> IDENTIFIED BY <contraseña>;`.
+
+**Tengo una cadena JDBC (`jdbc:oracle:thin:@host:1521/SERVICIO`).**
+Rellena el formulario con sus partes: *Host* = `host`, *Puerto* = `1521`, *Service name* = `SERVICIO`.
+
 **Oracle no arranca en la demo.**
 Oracle 23ai Free necesita unos 2–3 GB de RAM libres. Con Podman, aumenta la memoria de la máquina virtual (`podman machine set --memory 6144`).

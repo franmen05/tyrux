@@ -8,8 +8,26 @@ RUN npm ci
 COPY frontend/ ./
 RUN npm run build
 
+# ---- Oracle Instant Client (enables python-oracledb thick mode, e.g. for 10G password verifiers) ----
+FROM debian:trixie-slim AS instantclient
+ARG TARGETARCH
+ARG IC_VERSION=23.26.3.0.0
+ARG IC_DIR=2326300
+RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates curl unzip \
+    && case "$TARGETARCH" in amd64) arch=x64 ;; arm64) arch=arm64 ;; *) echo "arch $TARGETARCH no soportada" >&2; exit 1 ;; esac \
+    && curl -fsSL -o /tmp/ic.zip \
+       "https://download.oracle.com/otn_software/linux/instantclient/${IC_DIR}/instantclient-basiclite-linux.${arch}-${IC_VERSION}.zip" \
+    && mkdir -p /opt/oracle && unzip -q /tmp/ic.zip -d /opt/oracle \
+    && mv /opt/oracle/instantclient_* /opt/oracle/instantclient
+
 # ---- runtime ----
 FROM python:3.12-slim
+# libaio is required by Instant Client; Debian 13 ships it as libaio1t64 (libaio.so.1t64)
+RUN apt-get update && apt-get install -y --no-install-recommends libaio1t64 \
+    && ln -s "$(find /usr/lib -name 'libaio.so.1t64' | head -n1)" "$(dirname "$(find /usr/lib -name 'libaio.so.1t64' | head -n1)")/libaio.so.1" \
+    && rm -rf /var/lib/apt/lists/*
+COPY --from=instantclient /opt/oracle/instantclient /opt/oracle/instantclient
+RUN echo /opt/oracle/instantclient > /etc/ld.so.conf.d/oracle-instantclient.conf && ldconfig
 COPY --from=ghcr.io/astral-sh/uv:0.13 /uv /usr/local/bin/uv
 
 ENV UV_COMPILE_BYTECODE=1 \
@@ -18,7 +36,9 @@ ENV UV_COMPILE_BYTECODE=1 \
     PYTHONUNBUFFERED=1 \
     PATH=/app/.venv/bin:$PATH \
     DBMON_DATA_DIR=/data \
-    DBMON_STATIC_DIR=/app/static
+    DBMON_STATIC_DIR=/app/static \
+    DBMON_ORACLE_MODE=auto \
+    DBMON_ORACLE_CLIENT_LIB_DIR=/opt/oracle/instantclient
 
 WORKDIR /app
 COPY backend/pyproject.toml backend/uv.lock ./
