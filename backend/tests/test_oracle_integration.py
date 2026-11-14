@@ -125,6 +125,28 @@ def _raw_connect():
     return c
 
 
+def _ensure_stale_order_items() -> None:
+    """Make sure ORDER_ITEMS has stale statistics, as the demo init script leaves it.
+
+    Oracle's automatic optimizer statistics job (nightly maintenance window) regathers stale
+    tables. Newer demo containers disable it (docker/oracle-demo/01-init.sql), but a container
+    created earlier may already have fresh stats again; recreate the stale state in that case.
+    """
+    conn = _raw_connect()
+    try:
+        cur = conn.cursor()
+        cur.execute("SELECT stale_stats FROM user_tab_statistics "
+                    "WHERE table_name = 'ORDER_ITEMS' AND object_type = 'TABLE'")
+        row = cur.fetchone()
+        if row and row[0] == "YES":
+            return
+        cur.execute("UPDATE order_items SET quantity = quantity + 1 WHERE MOD(item_id, 3) = 0")
+        conn.commit()
+        cur.callproc("DBMS_STATS.FLUSH_DATABASE_MONITORING_INFO")
+    finally:
+        conn.close()
+
+
 def _prime():
     """Small deterministic workload so the cursor cache holds the slow statements.
 
@@ -154,6 +176,7 @@ def coll():
     res = c.test_connection()
     if not res.ok:
         pytest.skip(f"Oracle demo no disponible: {res.message}")
+    _ensure_stale_order_items()
     _prime()
     yield c
     c.close()

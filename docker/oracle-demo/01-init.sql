@@ -31,6 +31,14 @@ GRANT ANALYZE ANY TO shop;
 -- Track every index access in DBA_INDEX_USAGE (default is sampled), demo only.
 ALTER SYSTEM SET "_iut_stat_collection_type" = 'ALL' SCOPE = BOTH;
 
+-- Keep the demo deterministic: the nightly automatic optimizer stats job would regather the
+-- deliberately stale ORDER_ITEMS statistics (and the stale_stats recommendation would vanish).
+BEGIN
+  DBMS_AUTO_TASK_ADMIN.DISABLE(client_name => 'auto optimizer stats collection',
+                               operation => NULL, window_name => NULL);
+END;
+/
+
 ALTER SESSION SET CURRENT_SCHEMA = shop;
 
 CREATE TABLE customers (
