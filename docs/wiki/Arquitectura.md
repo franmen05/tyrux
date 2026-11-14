@@ -43,4 +43,4 @@ Todo bajo `/api`; la documentación interactiva de FastAPI está en `/docs`.
 | Optimización | `POST /connections/{id}/optimize/script` |
 | Monitoreo | `GET/POST/DELETE /connections/{id}/monitor`, `GET /connections/{id}/metrics`, `GET /connections/{id}/metrics/top-queries`, `DELETE /connections/{id}/metrics` |
 
-El diseño completo está en [`docs/superpowers/specs/`](https://github.com/franmen05/tyrux/tree/main/docs/superpowers/specs).
+El diseño completo está en [`docs/specs/`](https://github.com/franmen05/tyrux/tree/main/docs/specs).

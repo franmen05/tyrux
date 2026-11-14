@@ -104,7 +104,7 @@ cd e2e && npm install && npx playwright install chromium && npm test
 
 Estructura: `backend/` (FastAPI, colectores en `app/collectors/`), `frontend/` (React + Vite),
 `docker/` (bases demo y generadores de carga), `e2e/` (Playwright), diseño en
-`docs/superpowers/specs/`.
+`docs/specs/`.
 
 ## Licencia
 
