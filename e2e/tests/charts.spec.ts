@@ -47,6 +47,33 @@ test.describe('Gráficos (conexión demo, monitor activo)', () => {
     await expect(top.locator('.recharts-bar-rectangle').first()).toBeAttached()
   })
 
+  test('consulta más larga: clic en el gráfico muestra la consulta de ese momento', async ({ page }) => {
+    await page.getByTestId('window-60').click()
+    const card = page.getByTestId('chart-longest')
+    await expect(card).toBeVisible()
+    const svg = card.locator('svg.recharts-surface').first()
+    await svg.scrollIntoViewIfNeeded()
+    await expect(card.locator('.recharts-line-curve').first()).toBeAttached()
+    const box = (await svg.boundingBox())!
+    const req = page.waitForRequest((r) => r.url().includes('/metrics/longest-query?at='))
+    await page.mouse.move(box.x + box.width * 0.9, box.y + box.height / 2)
+    await page.mouse.click(box.x + box.width * 0.9, box.y + box.height / 2)
+    await req
+    const drawer = page.getByTestId('longest-query-drawer')
+    await expect(drawer).toBeVisible()
+    await expect(drawer.getByTestId('longest-query-ts')).not.toHaveText('')
+    await expect(drawer.getByTestId('longest-query-sql').or(drawer.getByTestId('longest-query-empty'))).toBeVisible()
+    await page.getByTestId('drawer-close').click()
+    await expect(drawer).toBeHidden()
+
+    const latest = page.getByTestId('longest-query-latest-btn')
+    if (await latest.isEnabled()) {
+      await latest.click()
+      await expect(page.getByTestId('longest-query-drawer')).toBeVisible()
+      await expect(page.getByTestId('longest-query-duration')).not.toHaveText('—')
+    }
+  })
+
   test('selector de ventana cambia aria-pressed y la petición de métricas', async ({ page }) => {
     await expect(page.getByTestId('window-15')).toHaveAttribute('aria-pressed', 'true')
     for (const m of [5, 60, 360, 1440]) {

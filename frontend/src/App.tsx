@@ -1,11 +1,12 @@
 import { NavLink, Navigate, Route, Routes, Link } from 'react-router-dom'
-import { Activity, Database, LineChart, Wrench, Sparkles, type LucideIcon } from 'lucide-react'
+import { Activity, Database, GitCompare, LineChart, Wrench, Sparkles, type LucideIcon } from 'lucide-react'
 import { useApp } from './lib/app'
 import { Badge, Button, EmptyState, ErrorBanner, cn, inputCls } from './components/ui'
 import ConnectionsPage from './pages/ConnectionsPage'
 import ChartsPage from './pages/ChartsPage'
 import TechnicalPage from './pages/TechnicalPage'
 import OptimizePage from './pages/OptimizePage'
+import ComparePage from './pages/ComparePage'
 import type { ReactNode } from 'react'
 
 const NAV: { to: string; label: string; icon: LucideIcon; id: string }[] = [
@@ -13,6 +14,7 @@ const NAV: { to: string; label: string; icon: LucideIcon; id: string }[] = [
   { to: '/charts', label: 'Gráficos', icon: LineChart, id: 'nav-charts' },
   { to: '/technical', label: 'Técnico', icon: Wrench, id: 'nav-technical' },
   { to: '/optimize', label: 'Optimización', icon: Sparkles, id: 'nav-optimize' },
+  { to: '/compare', label: 'Comparar índices', icon: GitCompare, id: 'nav-compare' },
 ]
 
 export const ENGINE_LABEL = { postgres: 'PostgreSQL', oracle: 'Oracle' } as const
@@ -101,6 +103,7 @@ export default function App() {
             <Route path="/charts" element={<RequireConnection><ChartsPage /></RequireConnection>} />
             <Route path="/technical" element={<RequireConnection><TechnicalPage /></RequireConnection>} />
             <Route path="/optimize" element={<RequireConnection><OptimizePage /></RequireConnection>} />
+            <Route path="/compare" element={<ComparePage />} />
             <Route path="*" element={<Navigate to="/" replace />} />
           </Routes>
         </div>

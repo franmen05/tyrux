@@ -88,6 +88,10 @@ Diagnostics (on demand, live)
 - `GET  /api/connections/{id}/recommendations` → `Recommendation[]`
 - `POST /api/connections/{id}/optimize/script` (`ScriptRequest`) → `ScriptResult`
 
+Compare indexes (two saved connections; DDL in the target's dialect, never executed)
+- `POST /api/compare/indexes` (`IndexCompareRequest`) → `IndexCompareResult`
+- `POST /api/compare/indexes/script` (`IndexCopyScriptRequest`) → `ScriptResult`
+
 Monitoring
 - `GET    /api/connections/{id}/monitor` → `MonitorStatus`
 - `POST   /api/connections/{id}/monitor` (`MonitorStart`) → `MonitorStatus`

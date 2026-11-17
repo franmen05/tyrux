@@ -1,7 +1,7 @@
 import type {
   ActiveQuery, ConfigParam, ConnectionIn, ConnectionOut, ExplainRequest, ExplainResult,
-  IndexStat, LockInfo, MetricSeries, MonitorStart, MonitorStatus, Overview, Recommendation,
-  ScriptResult, TableStat, TestResult, TopOrder, TopQuery,
+  IndexCompareResult, IndexStat, LockInfo, LongestQueryAt, MetricSeries, MonitorStart, MonitorStatus, Overview, Recommendation,
+  RecFilters, RecommendationPage, ScriptRequest, ScriptResult, TableStat, TestResult, TopOrder, TopQuery,
 } from './types'
 
 const BASE = '/api'
@@ -78,15 +78,30 @@ export const api = {
   locks: (id: number) => request<LockInfo[]>('GET', `${c(id)}/locks`),
   config: (id: number) => request<ConfigParam[]>('GET', `${c(id)}/config`),
   recommendations: (id: number) => request<Recommendation[]>('GET', `${c(id)}/recommendations`),
-  optimizeScript: (id: number, recommendation_ids: string[]) =>
-    request<ScriptResult>('POST', `${c(id)}/optimize/script`, { recommendation_ids }),
+  recommendationsPage: (id: number, offset: number, limit: number, f: RecFilters = {}, refresh = false) => {
+    const p = new URLSearchParams({ offset: String(offset), limit: String(limit) })
+    if (f.category) p.set('category', f.category)
+    if (f.severity) p.set('severity', f.severity)
+    if (f.search?.trim()) p.set('search', f.search.trim())
+    if (refresh) p.set('refresh', 'true')
+    return request<RecommendationPage>('GET', `${c(id)}/recommendations/page?${p}`)
+  },
+  optimizeScript: (id: number, b: ScriptRequest | string[]) =>
+    request<ScriptResult>('POST', `${c(id)}/optimize/script`, Array.isArray(b) ? { recommendation_ids: b } : b),
 
   monitorStatus: (id: number) => request<MonitorStatus>('GET', `${c(id)}/monitor`),
   monitorStart: (id: number, b: MonitorStart) => request<MonitorStatus>('POST', `${c(id)}/monitor`, b),
   monitorStop: (id: number) => request<MonitorStatus>('DELETE', `${c(id)}/monitor`),
   metrics: (id: number, minutes: number) =>
     request<MetricSeries>('GET', `${c(id)}/metrics?minutes=${minutes}`),
+  metricsLongestQuery: (id: number, at: string) =>
+    request<LongestQueryAt>('GET', `${c(id)}/metrics/longest-query?at=${encodeURIComponent(at)}`),
   metricsTopQueries: (id: number, minutes: number) =>
     request<TopQuery[]>('GET', `${c(id)}/metrics/top-queries?minutes=${minutes}`),
   clearMetrics: (id: number) => request<void>('DELETE', `${c(id)}/metrics`),
+
+  compareIndexes: (source_id: number, target_id: number) =>
+    request<IndexCompareResult>('POST', '/compare/indexes', { source_id, target_id }),
+  compareIndexesScript: (source_id: number, target_id: number, ids: string[]) =>
+    request<ScriptResult>('POST', '/compare/indexes/script', { source_id, target_id, ids }),
 }

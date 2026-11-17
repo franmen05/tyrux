@@ -171,6 +171,33 @@ export interface Recommendation {
   estimated_benefit: string | null
 }
 
+export interface RecommendationPage {
+  items: Recommendation[]
+  total: number // matching the filters
+  selectable_total: number // matching the filters and with SQL
+  offset: number
+  limit: number
+  total_all: number // without filters
+  by_severity: Partial<Record<Severity, number>>
+  by_category: Partial<Record<RecCategory, number>>
+  warnings: string[] // sections that failed / were truncated (partial result)
+  generated_at: string
+  elapsed_ms: number | null
+}
+
+export interface RecFilters {
+  category?: RecCategory
+  severity?: Severity
+  search?: string
+}
+
+/** Either explicit ids, or select_all (+ filters) minus exclude_ids. */
+export interface ScriptRequest extends RecFilters {
+  recommendation_ids?: string[]
+  select_all?: boolean
+  exclude_ids?: string[]
+}
+
 export interface ScriptResult {
   engine: Engine
   script: string
@@ -193,6 +220,16 @@ export interface MetricPoint {
   deadlocks_per_sec: number | null
 }
 
+/** Longest running statement captured by the sample closest to a chart point. */
+export interface LongestQueryAt {
+  ts: string
+  longest_query_seconds: number | null
+  query: string | null
+  query_id: string | null
+  username: string | null
+  session_id: string | null
+}
+
 export interface MetricSeries {
   connection_id: number
   interval_seconds: number | null
@@ -213,4 +250,39 @@ export interface MonitorStatus {
   samples: number
   last_sample_at: string | null
   last_error: string | null
+}
+
+// ---------------------------------------------------------------- compare indexes
+export type IndexDiffStatus = 'missing' | 'extra' | 'same' | 'different'
+
+export interface CompareSide {
+  id: number
+  name: string
+  engine: Engine
+  database: string
+}
+
+export interface IndexCompareItem {
+  id: string
+  status: IndexDiffStatus
+  table: string
+  source_schema: string | null
+  source_index: string | null
+  source_columns: string[]
+  source_unique: boolean | null
+  target_schema: string | null
+  target_index: string | null
+  target_columns: string[]
+  target_unique: boolean | null
+  is_primary: boolean
+  copiable: boolean
+  note: string | null
+  sql: string | null
+}
+
+export interface IndexCompareResult {
+  source: CompareSide
+  target: CompareSide
+  items: IndexCompareItem[]
+  counts: Record<IndexDiffStatus, number>
 }

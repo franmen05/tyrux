@@ -5,6 +5,7 @@
 - [[Gráficos y monitoreo]]
 - [[Sección técnica]]
 - [[Optimización]]
+- [[Comparar índices]]
 - [[Permisos]]
 - [[Arquitectura]]
 - [[Desarrollo y pruebas]]

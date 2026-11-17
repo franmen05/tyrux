@@ -2,14 +2,15 @@ import { useMemo, useState, type ReactNode } from 'react'
 import { Link } from 'react-router-dom'
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 import {
-  Area, AreaChart, Bar, BarChart, CartesianGrid, Legend, Line, LineChart, ResponsiveContainer, Tooltip, XAxis, YAxis,
+  Area, AreaChart, Bar, BarChart, CartesianGrid, Legend, Line, LineChart, ReferenceLine, ResponsiveContainer, Tooltip, XAxis, YAxis,
 } from 'recharts'
-import { Play, Square, Activity, AlertTriangle, Trash2 } from 'lucide-react'
+import { Play, Square, Activity, AlertTriangle, Trash2, FileCode2 } from 'lucide-react'
 import { api } from '../api/client'
 import type { MetricPoint, MonitorStatus } from '../api/types'
 import { useConnId, useApp } from '../lib/app'
 import { fmtBytes, fmtDate, fmtMs, fmtNumber, fmtPct, fmtSeconds, fmtTime, parseTs, truncate } from '../lib/format'
 import { Button, Card, EmptyState, ErrorBanner, PageHeader, Skeleton, cn, inputCls } from '../components/ui'
+import LongestQueryDrawer from '../components/LongestQueryDrawer'
 
 const PRESETS = [
   { s: 1, label: '1 s' }, { s: 5, label: '5 s' }, { s: 10, label: '10 s' },
@@ -30,10 +31,13 @@ function Kpi({ id, label, value, sub, loading }: { id: string; label: string; va
   )
 }
 
-function ChartCard({ id, title, children }: { id: string; title: string; children: ReactNode }) {
+function ChartCard({ id, title, children, actions }: { id: string; title: string; children: ReactNode; actions?: ReactNode }) {
   return (
     <Card data-testid={id} className="p-4">
-      <h3 className="mb-3 text-sm font-semibold">{title}</h3>
+      <div className="mb-3 flex items-center justify-between gap-2">
+        <h3 className="text-sm font-semibold">{title}</h3>
+        {actions}
+      </div>
       <div className="h-56">{children}</div>
     </Card>
   )
@@ -45,8 +49,20 @@ const tooltipStyle = { background: 'var(--c-surface)', border: '1px solid var(--
 type Row = MetricPoint & { t: number }
 
 function TimeChartBase({
-  data, yFormat, children, kind = 'line', unit,
-}: { data: Row[]; yFormat?: (v: number) => string; children: ReactNode; kind?: 'line' | 'area'; unit?: string }) {
+  data, yFormat, children, kind = 'line', unit, onPointClick,
+}: {
+  data: Row[]; yFormat?: (v: number) => string; children: ReactNode; kind?: 'line' | 'area'; unit?: string
+  /** Called with the clicked point (makes the chart clickable). */
+  onPointClick?: (row: Row) => void
+}) {
+  const handleClick = onPointClick
+    ? (state: { activeLabel?: string | number } | null) => {
+      const t = Number(state?.activeLabel)
+      const row = data.find((r) => r.t === t)
+      if (row) onPointClick(row)
+    }
+    : undefined
+  const style = onPointClick ? { cursor: 'pointer' } : undefined
   const common = (
     <>
       <CartesianGrid stroke="var(--c-line)" strokeDasharray="3 3" />
@@ -59,9 +75,9 @@ function TimeChartBase({
   return (
     <ResponsiveContainer width="100%" height="100%">
       {kind === 'area' ? (
-        <AreaChart data={data}>{common}{children}</AreaChart>
+        <AreaChart data={data} onClick={handleClick} style={style}>{common}{children}</AreaChart>
       ) : (
-        <LineChart data={data}>{common}{children}</LineChart>
+        <LineChart data={data} onClick={handleClick} style={style}>{common}{children}</LineChart>
       )}
     </ResponsiveContainer>
   )
@@ -152,6 +168,7 @@ export default function ChartsPage() {
   const qc = useQueryClient()
   const { toast } = useApp()
   const [minutes, setMinutes] = useState(15)
+  const [queryAt, setQueryAt] = useState<string | null>(null)
 
   const overview = useQuery({ queryKey: ['overview', id], queryFn: () => api.overview(id), refetchInterval: 10000 })
   const status = useQuery({
@@ -191,6 +208,7 @@ export default function ChartsPage() {
       .map((q) => ({ ...q, label: truncate(q.query, 40) })),
     [topQ.data],
   )
+  const lastWithQuery = useMemo(() => [...data].reverse().find((r) => r.longest_query_seconds != null), [data])
   const o = overview.data
   const noPoints = !metrics.isLoading && !metrics.error && data.length === 0
 
@@ -289,9 +307,26 @@ export default function ChartsPage() {
             </ResponsiveContainer>
           </ChartCard>
           <div className="lg:col-span-2">
-            <ChartCard id="chart-longest" title="Consulta más larga (s)">
-              <TimeChartBase data={data} yFormat={(v) => fmtNumber(v, 1)} unit=" s">
-                <Line type="monotone" dataKey="longest_query_seconds" name="Más larga (s)" stroke={COLORS.e} dot={false} strokeWidth={2} isAnimationActive={false} />
+            <ChartCard
+              id="chart-longest" title="Consulta más larga (s)"
+              actions={
+                <div className="flex items-center gap-3">
+                  <span className="hidden text-xs text-muted sm:inline">Clic en un punto para ver la consulta</span>
+                  <Button
+                    variant="ghost" data-testid="longest-query-latest-btn" title="Ver la consulta del punto más reciente"
+                    disabled={!lastWithQuery} onClick={() => lastWithQuery && setQueryAt(lastWithQuery.ts)}
+                  >
+                    <FileCode2 size={14} /> Ver consulta
+                  </Button>
+                </div>
+              }
+            >
+              <TimeChartBase data={data} yFormat={(v) => fmtNumber(v, 1)} unit=" s" onPointClick={(r) => setQueryAt(r.ts)}>
+                <Line
+                  type="monotone" dataKey="longest_query_seconds" name="Más larga (s)" stroke={COLORS.e} dot={false} strokeWidth={2} isAnimationActive={false}
+                  activeDot={{ r: 6, style: { cursor: 'pointer' } }}
+                />
+                {queryAt && <ReferenceLine x={parseTs(queryAt).getTime()} stroke={COLORS.e} strokeDasharray="4 2" />}
               </TimeChartBase>
             </ChartCard>
           </div>
@@ -330,6 +365,7 @@ export default function ChartsPage() {
           </div>
         )}
       </Card>
+      {queryAt && <LongestQueryDrawer at={queryAt} onClose={() => setQueryAt(null)} />}
     </div>
   )
 }

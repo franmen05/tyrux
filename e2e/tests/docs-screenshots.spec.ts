@@ -23,6 +23,35 @@ for (const scheme of ['light', 'dark'] as const) {
   })
 }
 
+test('gráficos: consulta más larga en un momento', async ({ page }) => {
+  await page.goto('/charts')
+  await page.getByTestId('window-60').click()
+  const btn = page.getByTestId('longest-query-latest-btn')
+  await expect(btn).toBeEnabled({ timeout: 30_000 })
+  await btn.click()
+  await expect(page.getByTestId('longest-query-sql')).toBeVisible({ timeout: 20_000 })
+  await page.waitForTimeout(500)
+  await page.screenshot({ path: shot('charts-longest-query') })
+})
+
+test('comparar índices (PostgreSQL → Oracle)', async ({ page }) => {
+  test.skip(!process.env.E2E_ORACLE, 'needs E2E_ORACLE=1 and connection 101')
+  await page.goto('/compare')
+  await page.getByTestId('compare-source').selectOption('1')
+  await page.getByTestId('compare-target').selectOption('101')
+  await page.getByTestId('compare-run-btn').click()
+  await expect(page.getByTestId('compare-row').first()).toBeVisible({ timeout: 60_000 })
+  await page.getByTestId('compare-filter-missing').click()
+  await page.getByTestId('compare-select-all').click()
+  await page.waitForTimeout(300)
+  await page.screenshot({ path: shot('compare-indexes') })
+  await page.getByTestId('compare-generate-btn').click()
+  await expect(page.getByTestId('compare-script-output')).toBeVisible({ timeout: 20_000 })
+  await page.getByTestId('compare-script-output').scrollIntoViewIfNeeded()
+  await page.waitForTimeout(300)
+  await page.screenshot({ path: shot('compare-script') })
+})
+
 test('conexiones y formulario', async ({ page }) => {
   await page.goto('/connections')
   await expect(page.getByTestId('connection-row').first()).toBeVisible()

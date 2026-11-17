@@ -10,7 +10,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse
 
 from app import oracle_client
-from app.api import connections, diagnostics, monitor, optimize
+from app.api import compare, connections, diagnostics, monitor, optimize
 from app.sampler import manager
 
 logging.basicConfig(level=os.environ.get("DBMON_LOG_LEVEL", "INFO"))
@@ -36,7 +36,7 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-for module in (connections, diagnostics, monitor, optimize):
+for module in (connections, diagnostics, monitor, optimize, compare):
     app.include_router(module.router, prefix="/api")
 
 

@@ -197,8 +197,29 @@ class Recommendation(BaseModel):
     estimated_benefit: Optional[str] = None
 
 
+class RecommendationPage(BaseModel):
+    """One page of the (cached) recommendations of a connection, after filters."""
+    items: list[Recommendation]
+    total: int                      # matching the filters
+    selectable_total: int           # matching the filters and with SQL (selectable for the script)
+    offset: int
+    limit: int
+    total_all: int                  # all recommendations, without filters
+    by_severity: dict[str, int] = Field(default_factory=dict)   # counts without filters
+    by_category: dict[str, int] = Field(default_factory=dict)   # counts without filters
+    warnings: list[str] = Field(default_factory=list)  # sections that failed / were truncated
+    generated_at: datetime
+    elapsed_ms: Optional[float] = None
+
+
 class ScriptRequest(BaseModel):
-    recommendation_ids: list[str]
+    recommendation_ids: list[str] = Field(default_factory=list)
+    # "Select all" across pages: every recommendation with SQL matching the filters, minus exclude_ids.
+    select_all: bool = False
+    exclude_ids: list[str] = Field(default_factory=list)
+    category: Optional[RecCategory] = None
+    severity: Optional[Severity] = None
+    search: Optional[str] = None
 
 
 class ScriptResult(BaseModel):
@@ -219,6 +240,11 @@ class MetricSample(BaseModel):
     cache_hit_ratio: Optional[float] = None
     size_bytes: Optional[int] = None
     longest_query_seconds: Optional[float] = None
+    # the statement behind longest_query_seconds at sample time (truncated text)
+    longest_query_text: Optional[str] = None
+    longest_query_id: Optional[str] = None       # PG queryid (14+) / Oracle sql_id
+    longest_query_user: Optional[str] = None
+    longest_query_session: Optional[str] = None  # PG pid / Oracle "sid,serial#"
     # counters (cumulative)
     commits: Optional[int] = None
     rollbacks: Optional[int] = None
@@ -243,6 +269,16 @@ class MetricPoint(BaseModel):
     deadlocks_per_sec: Optional[float] = None
 
 
+class LongestQueryAt(BaseModel):
+    """The longest running statement captured by the sample closest to a chart point."""
+    ts: datetime
+    longest_query_seconds: Optional[float] = None
+    query: Optional[str] = None
+    query_id: Optional[str] = None
+    username: Optional[str] = None
+    session_id: Optional[str] = None
+
+
 class MetricSeries(BaseModel):
     connection_id: int
     interval_seconds: Optional[float] = None
@@ -263,3 +299,48 @@ class MonitorStatus(BaseModel):
     samples: int = 0
     last_sample_at: Optional[datetime] = None
     last_error: Optional[str] = None
+
+
+# ---------------------------------------------------------------- compare indexes
+IndexDiffStatus = Literal["missing", "extra", "same", "different"]
+
+
+class IndexCompareRequest(BaseModel):
+    source_id: int
+    target_id: int
+
+
+class IndexCopyScriptRequest(IndexCompareRequest):
+    ids: list[str]
+
+
+class CompareSide(BaseModel):
+    id: int
+    name: str
+    engine: Engine
+    database: str
+
+
+class IndexCompareItem(BaseModel):
+    id: str                          # "src:<schema>.<index>" or "dst:<schema>.<index>" (extra)
+    status: IndexDiffStatus
+    table: str
+    source_schema: Optional[str] = None
+    source_index: Optional[str] = None
+    source_columns: list[str] = Field(default_factory=list)
+    source_unique: Optional[bool] = None
+    target_schema: Optional[str] = None
+    target_index: Optional[str] = None
+    target_columns: list[str] = Field(default_factory=list)
+    target_unique: Optional[bool] = None
+    is_primary: bool = False
+    copiable: bool = False
+    note: Optional[str] = None
+    sql: Optional[str] = None        # DDL for the target (only when copiable)
+
+
+class IndexCompareResult(BaseModel):
+    source: CompareSide
+    target: CompareSide
+    items: list[IndexCompareItem] = Field(default_factory=list)
+    counts: dict[str, int] = Field(default_factory=dict)

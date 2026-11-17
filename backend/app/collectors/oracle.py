@@ -14,6 +14,7 @@ Everything works from inside a PDB: V$ views are container-scoped there and CDB_
 """
 from __future__ import annotations
 
+import logging
 import re
 import time
 import uuid
@@ -30,6 +31,7 @@ from app.schemas import (
     LockInfo, MetricSample, Overview, Recommendation, TableStat, TestResult, TopQuery,
 )
 
+LONGEST_QUERY_MAX = 4000          # chars of the longest query kept per sample
 MODULE = "dbmon"                 # V$SESSION.MODULE of our own sessions (excluded everywhere)
 MAX_SQL_CHARS = 4000
 CALL_TIMEOUT_MS = 15000
@@ -38,6 +40,10 @@ ANALYZE_FETCH_CAP = 10000
 LARGE_TABLE_ROWS = 10000         # full scans below this size are not worth an index
 SIZE_CACHE_SECONDS = 60
 FLUSH_EVERY_SECONDS = 300
+REC_MAX_PLAN_ROWS = 2000         # full-scan plan steps analysed for missing indexes
+REC_BIND_CHUNK = 200             # (owner, table) pairs per dictionary query
+
+_log = logging.getLogger("dbmon.oracle")
 
 _PRIV_HINT = (
     " Conceda al usuario de monitorización el rol SELECT_CATALOG_ROLE "
@@ -459,8 +465,17 @@ class OracleCollector(Collector):
         """Optional query: on missing view/privilege/column, record a warning and return None."""
         try:
             return self._rows(conn, sql, binds)
-        except oracledb.DatabaseError as e:
+        except oracledb.Error as e:
             code = self._code(e)
+            if (code == "DPY-4024" or "ORA-01013" in str(e)) and self._healthy(conn):
+                # call timeout on a huge dictionary/cursor cache: degrade instead of failing the call
+                msg = (f"Tiempo límite superado al consultar {label or 'una vista opcional'} "
+                       f"({code or 'ORA-01013'}); se omitieron esos datos.")
+                if msg not in self._warnings:
+                    self._warnings.append(msg)
+                return None
+            if not isinstance(e, oracledb.DatabaseError):
+                raise
             if code in ("ORA-00942", "ORA-01031", "ORA-00904", "ORA-06550", "ORA-04043"):
                 msg = f"No accesible: {label or 'vista opcional'} ({code})."
                 if code in ("ORA-00942", "ORA-01031"):
@@ -584,9 +599,30 @@ class OracleCollector(Collector):
                 top_queries_available=top_ok, warnings=list(self._warnings))
         return self._run(fn)
 
+    def _longest_query(self, conn) -> dict:
+        """The statement behind longest_query_seconds (same filters as _metrics)."""
+        rows = self._opt_rows(conn, f"""
+            SELECT s.sid, s.serial# serial, s.username, s.sql_id,
+                   q.sql_fulltext sql_text
+            FROM v$session s
+            LEFT JOIN v$sql q ON q.sql_id = s.sql_id AND q.child_number = s.sql_child_number
+            WHERE s.type = 'USER' AND s.status = 'ACTIVE' AND s.sid <> :own
+              AND NVL(s.module, '-') <> '{MODULE}'
+            ORDER BY s.last_call_et DESC
+            FETCH FIRST 1 ROWS ONLY""", {"own": self._own_sid(conn)}, label="V$SQL")
+        if not rows:
+            return {}
+        r = rows[0]
+        text = (r["sql_text"] or "")[:LONGEST_QUERY_MAX]
+        return {"longest_query_text": text or None, "longest_query_id": r["sql_id"],
+                "longest_query_user": r["username"],
+                "longest_query_session": f"{r['sid']},{r['serial']}"}
+
     def sample(self) -> MetricSample:
         def fn(conn):
             m = self._metrics(conn)
+            if m.get("longest_query_seconds") is not None:
+                m.update(self._longest_query(conn))
             return MetricSample(ts=datetime.now(timezone.utc), **m)
         return self._run(fn)
 
@@ -896,13 +932,15 @@ class OracleCollector(Collector):
             GROUP BY p.object_owner, p.object_name""", label="V$SQL_PLAN")
         return {f"{x['o']}.{x['n']}": int(x["c"]) for x in (r or [])}
 
-    def _segment_sizes(self, conn) -> tuple[dict[str, int], dict[str, int]]:
+    def _segment_sizes(self, conn, indexes_only: bool = False) -> tuple[dict[str, int], dict[str, int]]:
+        kinds = ("segment_type LIKE 'INDEX%'" if indexes_only
+                 else "(segment_type LIKE 'TABLE%' OR segment_type LIKE 'INDEX%')")
         r = self._opt_rows(conn, f"""
             SELECT owner, segment_name, CASE WHEN segment_type LIKE 'INDEX%' THEN 'I' ELSE 'T' END k,
                    SUM(bytes) b
             FROM dba_segments
             WHERE owner IN ({_APP_OWNERS})
-              AND (segment_type LIKE 'TABLE%' OR segment_type LIKE 'INDEX%')
+              AND {kinds}
             GROUP BY owner, segment_name, CASE WHEN segment_type LIKE 'INDEX%' THEN 'I' ELSE 'T' END""",
                            label="DBA_SEGMENTS")
         tables, idx = {}, {}
@@ -989,7 +1027,7 @@ class OracleCollector(Collector):
             WHERE owner IN ({_APP_OWNERS})""", label="DBA_INDEX_USAGE (12.2+)")
         use = {f"{u['owner']}.{u['name']}": u for u in (usage or [])}
         plan_use = self._index_plan_usage(conn)
-        _, isize = self._segment_sizes(conn)
+        _, isize = self._segment_sizes(conn, indexes_only=True)
 
         dup_input = []
         for r in rows:
@@ -1094,28 +1132,96 @@ class OracleCollector(Collector):
         return self._run(fn)
 
     # ------------------------------------------------------------------ recommendations
+    # Each section runs independently (_rec_section): on a very large database a call timeout or an
+    # error in one of them only drops that section and adds a warning; the rest is still returned.
+    def _rec_section(self, label: str, fn: Callable[[oracledb.Connection], list[Recommendation]],
+                     dict_warnings: list[str]) -> Optional[list[Recommendation]]:
+        self._warnings = []
+        conn = None
+        try:
+            conn = self._get_conn()
+            return fn(conn) or []
+        except Exception as e:  # driver errors, CollectorError, unexpected data
+            if isinstance(e, oracledb.Error):
+                msg = self._message(e)
+                if conn is not None and (self._is_conn_error(e) or not self._healthy(conn)):
+                    self.close()   # the next section reconnects
+            else:
+                msg = str(e) or type(e).__name__
+                if not isinstance(e, CollectorError):
+                    _log.exception("recommendations section %r failed", label)
+            self.rec_warnings.append(f"{label}: no se pudo completar ({msg.rstrip('.')}). "
+                                     "El resto de recomendaciones sí se calculó.")
+            return None
+        finally:
+            for w in self._warnings:
+                if w not in dict_warnings:
+                    dict_warnings.append(w)
+
     def recommendations(self) -> list[Recommendation]:
-        def fn(conn):
-            self._flush_monitoring(conn)
-            recs: list[Recommendation] = []
-            recs += self._rec_missing_indexes(conn)
-            idx = self._index_data(conn)
-            recs += self._rec_indexes(idx)
-            recs += self._rec_stale(conn)
-            recs += self._rec_config(conn)
-            recs += self._rec_queries(conn)
-            if self._warnings:
-                recs.append(Recommendation(
-                    id="config:privileges", category="config", severity="info",
-                    title="Algunas vistas del diccionario no son accesibles",
-                    detail=" ".join(self._warnings),
-                    sql="-- Ejecutar como DBA:\nGRANT SELECT_CATALOG_ROLE TO " + q(self.cfg.username.upper()) + ";"))
-            order = {"high": 0, "medium": 1, "low": 2, "info": 3}
-            recs.sort(key=lambda r: (order[r.severity], r.category, r.id))
-            return recs
-        return self._run(fn)
+        self.rec_warnings = []
+        self._get_conn()   # cannot connect at all -> CollectorError (HTTP 502)
+        dict_warnings: list[str] = []
+        try:
+            self._flush_monitoring(self._get_conn())
+        except oracledb.Error:
+            pass
+        sections: list[tuple[str, Callable[[oracledb.Connection], list[Recommendation]]]] = [
+            ("Índices faltantes (planes del cursor cache)", self._rec_missing_indexes),
+            ("Índices duplicados / sin uso", lambda conn: self._rec_indexes(self._index_data(conn))),
+            ("Estadísticas obsoletas", self._rec_stale),
+            ("Configuración", self._rec_config),
+            ("Consultas costosas", self._rec_queries),
+        ]
+        recs: list[Recommendation] = []
+        failed = 0
+        for label, fn in sections:
+            out = self._rec_section(label, fn, dict_warnings)
+            if out is None:
+                failed += 1
+            else:
+                recs += out
+        if failed == len(sections):
+            raise CollectorError("No se pudo calcular ninguna recomendación: " + " | ".join(self.rec_warnings))
+        priv = [w for w in dict_warnings if w.startswith("No accesible")]
+        self.rec_warnings += [w for w in dict_warnings if not w.startswith("No accesible")]
+        if priv:
+            recs.append(Recommendation(
+                id="config:privileges", category="config", severity="info",
+                title="Algunas vistas del diccionario no son accesibles",
+                detail=" ".join(priv),
+                sql="-- Ejecutar como DBA:\nGRANT SELECT_CATALOG_ROLE TO " + q(self.cfg.username.upper()) + ";"))
+        order = {"high": 0, "medium": 1, "low": 2, "info": 3}
+        recs.sort(key=lambda r: (order[r.severity], r.category, r.id))
+        return recs
+
+    def _columns_and_indexes(self, conn, keys: set[tuple[str, str]]
+                             ) -> tuple[dict[str, set[str]], dict[str, list[list[str]]]]:
+        """Columns and index column lists of several tables, in batches (no query per table)."""
+        tcols: dict[str, set[str]] = {f"{o}.{n}": set() for o, n in keys}
+        per_idx: dict[str, dict[str, list[str]]] = {k: {} for k in tcols}
+        items = sorted(keys)
+        for i in range(0, len(items), REC_BIND_CHUNK):
+            chunk = items[i:i + REC_BIND_CHUNK]
+            binds: dict[str, str] = {}
+            pairs = []
+            for j, (o, n) in enumerate(chunk):
+                binds[f"o{j}"], binds[f"n{j}"] = o, n
+                pairs.append(f"(:o{j}, :n{j})")
+            inlist = ", ".join(pairs)
+            for x in self._opt_rows(conn, f"""SELECT owner o, table_name n, column_name c FROM dba_tab_columns
+                                              WHERE (owner, table_name) IN ({inlist})""", binds,
+                                    label="DBA_TAB_COLUMNS") or []:
+                tcols.setdefault(f"{x['o']}.{x['n']}", set()).add(x["c"])
+            for x in self._opt_rows(conn, f"""SELECT table_owner o, table_name n, index_name i, column_name c
+                                              FROM dba_ind_columns WHERE (table_owner, table_name) IN ({inlist})
+                                              ORDER BY table_owner, table_name, index_name, column_position""",
+                                    binds, label="DBA_IND_COLUMNS") or []:
+                per_idx.setdefault(f"{x['o']}.{x['n']}", {}).setdefault(x["i"], []).append(x["c"])
+        return tcols, {k: list(v.values()) for k, v in per_idx.items()}
 
     def _rec_missing_indexes(self, conn) -> list[Recommendation]:
+        # Bounded: the most expensive full-scan steps of the cursor cache only.
         rows = self._opt_rows(conn, f"""
             SELECT p.object_owner o, p.object_name n, p.filter_predicates fp, s.sql_id,
                    s.executions execs, s.elapsed_time el, t.num_rows
@@ -1127,19 +1233,19 @@ class OracleCollector(Collector):
               AND p.filter_predicates IS NOT NULL
               AND p.object_owner IN ({_APP_OWNERS})
               AND NVL(s.module, '-') <> '{MODULE}'
-              AND t.num_rows >= {LARGE_TABLE_ROWS}""", label="V$SQL_PLAN")
+              AND t.num_rows >= {LARGE_TABLE_ROWS}
+            ORDER BY s.elapsed_time DESC
+            FETCH FIRST {REC_MAX_PLAN_ROWS} ROWS ONLY""", label="V$SQL_PLAN")
         if not rows:
             return []
-        tcols: dict[str, set[str]] = {}
-        icols: dict[str, list[list[str]]] = {}
+        if len(rows) >= REC_MAX_PLAN_ROWS:
+            self.rec_warnings.append(
+                f"Índices faltantes: se analizaron los {REC_MAX_PLAN_ROWS:,} accesos completos (TABLE ACCESS "
+                "FULL) más costosos del cursor cache.")
+        tcols, icols = self._columns_and_indexes(conn, {(r["o"], r["n"]) for r in rows})
         cand: dict[tuple[str, str, tuple[str, ...]], dict] = {}
         for r in rows:
             tk = f"{r['o']}.{r['n']}"
-            if tk not in tcols:
-                info, ic = self._plan_objects(conn, [{"object_owner": r["o"], "object_name": r["n"],
-                                                       "operation": "TABLE ACCESS"}])
-                tcols[tk] = info.get(tk, {}).get("columns", set())
-                icols[tk] = ic.get(tk, [])
             cols = [c for c in predicate_columns(r["fp"]) if not tcols[tk] or c in tcols[tk]][:3]
             if not cols or any(ic[: len(cols)] == cols for ic in icols[tk]):
                 continue

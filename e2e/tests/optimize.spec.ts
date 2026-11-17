@@ -69,3 +69,74 @@ test.describe('Optimización', () => {
     await expect(page.getByTestId('selected-count')).toHaveText(/^0 de/)
   })
 })
+
+test.describe('Optimización con muchas recomendaciones (lista simulada)', () => {
+  const N = 120
+  const all = Array.from({ length: N }, (_, i) => {
+    const n = String(i).padStart(3, '0')
+    return {
+      id: `unused_index:public.idx_${n}`, category: 'unused_index', severity: i < 40 ? 'high' : 'low',
+      title: `Índice sin uso idx_${n}`, detail: 'detalle', object_name: `public.idx_${n}`,
+      sql: `DROP INDEX CONCURRENTLY IF EXISTS public.idx_${n};`, estimated_benefit: null,
+    }
+  })
+  let scriptBody: Record<string, unknown> | null = null
+
+  test.beforeEach(async ({ page }) => {
+    scriptBody = null
+    await page.route(/\/api\/connections\/\d+\/recommendations\/page/, async (route) => {
+      const u = new URL(route.request().url())
+      const off = Number(u.searchParams.get('offset')), lim = Number(u.searchParams.get('limit'))
+      const sev = u.searchParams.get('severity')
+      const m = sev ? all.filter((r) => r.severity === sev) : all
+      await route.fulfill({
+        json: {
+          items: m.slice(off, off + lim), total: m.length, selectable_total: m.length, offset: off, limit: lim,
+          total_all: N, by_severity: { high: 40, low: 80 }, by_category: { unused_index: N },
+          warnings: ['Índices duplicados / sin uso: no se pudo completar (timeout).'],
+          generated_at: new Date().toISOString(), elapsed_ms: 1234,
+        },
+      })
+    })
+    await page.route(/\/api\/connections\/\d+\/optimize\/script$/, async (route) => {
+      scriptBody = route.request().postDataJSON()
+      await route.fulfill({ json: { engine: 'postgres', script: '-- script\n', count: 1 } })
+    })
+    await page.goto('/optimize')
+  })
+
+  test('pagina, avisa del resultado parcial y filtra por severidad', async ({ page }) => {
+    await expect(page.getByTestId('rec-warnings')).toContainText('timeout')
+    await expect(page.getByTestId('recommendation-item')).toHaveCount(50)
+    await expect(page.getByTestId('rec-page-info')).toContainText('Página 1 de 3')
+    await page.getByTestId('rec-page-next').click()
+    await expect(page.getByTestId('recommendation-item').first()).toHaveAttribute('data-rec-id', 'unused_index:public.idx_050')
+    await page.getByTestId('rec-page-size').selectOption('100')
+    await expect(page.getByTestId('rec-page-info')).toContainText('Página 1 de 2')
+    await page.getByTestId('rec-filter-severity').selectOption('high')
+    await expect(page.getByTestId('recommendation-item')).toHaveCount(40)
+    await expect(page.getByTestId('rec-page-info')).toContainText('Página 1 de 1')
+    await expect(page.getByTestId('rec-group-low')).toHaveCount(0)
+  })
+
+  test('selección en varias páginas y «seleccionar todas» con exclusiones', async ({ page }) => {
+    await page.locator('[data-rec-id="unused_index:public.idx_001"]').getByTestId('rec-checkbox').check()
+    await page.getByTestId('rec-page-next').click()
+    await page.locator('[data-rec-id="unused_index:public.idx_060"]').getByTestId('rec-checkbox').check()
+    await expect(page.getByTestId('selected-count')).toHaveText(`2 de ${N} seleccionadas`)
+    await page.getByTestId('generate-script-btn').click()
+    await expect(page.getByTestId('script-output')).toBeVisible()
+    expect(scriptBody).toEqual({ recommendation_ids: ['unused_index:public.idx_001', 'unused_index:public.idx_060'] })
+
+    await page.getByTestId('select-all-recs').check()
+    await expect(page.getByTestId('selected-count')).toHaveText(`${N} de ${N} seleccionadas`)
+    await page.locator('[data-rec-id="unused_index:public.idx_060"]').getByTestId('rec-checkbox').uncheck()
+    await expect(page.getByTestId('selected-count')).toHaveText(`${N - 1} de ${N} seleccionadas`)
+    await page.getByTestId('generate-script-btn').click()
+    await expect.poll(() => scriptBody?.select_all).toBe(true)
+    expect(scriptBody?.exclude_ids).toEqual(['unused_index:public.idx_060'])
+    // changing the filters drops a "select all" made for other filters
+    await page.getByTestId('rec-filter-severity').selectOption('high')
+    await expect(page.getByTestId('selected-count')).toHaveText('0 de 40 seleccionadas')
+  })
+})

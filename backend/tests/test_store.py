@@ -107,3 +107,35 @@ def test_prune_and_clear(monkeypatch):
     assert store.count_samples(c.id) == 1
     store.clear_history(c.id)
     assert store.count_samples(c.id) == 0
+
+
+def test_longest_query_text_and_nearest_sample():
+    c = store.create_connection(conn_in())
+    t0 = datetime(2026, 1, 1, tzinfo=timezone.utc)
+    for i in range(3):
+        store.insert_sample(c.id, MetricSample(
+            ts=t0 + timedelta(seconds=10 * i), longest_query_seconds=float(i),
+            longest_query_text=f"select {i}", longest_query_id=f"id{i}",
+            longest_query_user="app", longest_query_session=str(100 + i)))
+    s = store.nearest_sample(c.id, t0 + timedelta(seconds=12))
+    assert s.longest_query_text == "select 1" and s.longest_query_session == "101"
+    assert s.longest_query_seconds == 1.0
+    assert store.nearest_sample(c.id, t0 + timedelta(seconds=17)).longest_query_id == "id2"
+    assert store.nearest_sample(c.id, t0 - timedelta(hours=1)).longest_query_text == "select 0"
+    assert store.get_samples(c.id, t0, t0 + timedelta(minutes=1))[2].longest_query_user == "app"
+    assert store.nearest_sample(c.id + 1, t0) is None
+
+
+def test_migration_adds_longest_query_columns(data_dir):
+    path = data_dir / "dbmon.sqlite"
+    old = sqlite3.connect(path)
+    old.execute("CREATE TABLE samples (connection_id INTEGER NOT NULL, ts REAL NOT NULL, "
+                + ", ".join(f"{f} REAL" for f in store.SAMPLE_FIELDS) + ")")
+    old.execute("INSERT INTO samples (connection_id, ts, sessions_active) VALUES (1, 1.0, 3)")
+    old.commit()
+    old.close()
+    store._initialized.clear()
+    s = store.nearest_sample(1, store.from_epoch(1.0))
+    assert s.sessions_active == 3 and s.longest_query_text is None
+    store.insert_sample(1, MetricSample(ts=store.from_epoch(2.0), longest_query_text="select 9"))
+    assert store.nearest_sample(1, store.from_epoch(2.0)).longest_query_text == "select 9"

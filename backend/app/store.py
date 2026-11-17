@@ -23,6 +23,10 @@ SAMPLE_FIELDS = [
     "cache_hit_ratio", "size_bytes", "longest_query_seconds",
     "commits", "rollbacks", "physical_reads", "logical_reads", "deadlocks",
 ]
+# text columns describing the longest running statement of each sample
+TEXT_SAMPLE_FIELDS = [
+    "longest_query_text", "longest_query_id", "longest_query_user", "longest_query_session",
+]
 _FLOAT_SAMPLE_FIELDS = {"cache_hit_ratio", "longest_query_seconds"}
 SNAPSHOT_FIELDS = [
     "query_id", "query", "calls", "total_time_ms", "rows", "disk_reads", "buffer_gets",
@@ -53,7 +57,8 @@ CREATE TABLE IF NOT EXISTS monitor_sessions (
 CREATE TABLE IF NOT EXISTS samples (
     connection_id INTEGER NOT NULL,
     ts REAL NOT NULL,
-    {", ".join(f"{f} REAL" for f in SAMPLE_FIELDS)}
+    {", ".join(f"{f} REAL" for f in SAMPLE_FIELDS)},
+    {", ".join(f"{f} TEXT" for f in TEXT_SAMPLE_FIELDS)}
 );
 CREATE INDEX IF NOT EXISTS ix_samples ON samples (connection_id, ts);
 CREATE TABLE IF NOT EXISTS query_snapshots (
@@ -89,10 +94,19 @@ def init_db() -> None:
         try:
             conn.execute("PRAGMA journal_mode=WAL")
             conn.executescript(_SCHEMA)
+            _migrate(conn)
             conn.commit()
         finally:
             conn.close()
         _initialized.add(path)
+
+
+def _migrate(conn: sqlite3.Connection) -> None:
+    """Add columns introduced after a database file was created."""
+    cols = {r[1] for r in conn.execute("PRAGMA table_info(samples)")}
+    for f in TEXT_SAMPLE_FIELDS:
+        if f not in cols:
+            conn.execute(f"ALTER TABLE samples ADD COLUMN {f} TEXT")
 
 
 @contextmanager
@@ -238,11 +252,12 @@ def active_sessions() -> list[MonitorSession]:
 
 # ---------------------------------------------------------------- samples
 def insert_sample(connection_id: int, sample: MetricSample) -> None:
-    values = [getattr(sample, f) for f in SAMPLE_FIELDS]
+    fields = SAMPLE_FIELDS + TEXT_SAMPLE_FIELDS
+    values = [getattr(sample, f) for f in fields]
     with _db() as db:
         db.execute(
-            f"INSERT INTO samples (connection_id, ts, {', '.join(SAMPLE_FIELDS)})"
-            f" VALUES (?, ?, {', '.join('?' * len(SAMPLE_FIELDS))})",
+            f"INSERT INTO samples (connection_id, ts, {', '.join(fields)})"
+            f" VALUES (?, ?, {', '.join('?' * len(fields))})",
             (connection_id, to_epoch(sample.ts), *values),
         )
 
@@ -251,6 +266,7 @@ def _row_to_sample(row: sqlite3.Row) -> MetricSample:
     # REAL column affinity returns floats; restore ints for integer fields
     data = {f: (float(row[f]) if f in _FLOAT_SAMPLE_FIELDS else int(row[f]))
             for f in SAMPLE_FIELDS if row[f] is not None}
+    data.update({f: row[f] for f in TEXT_SAMPLE_FIELDS if row[f] is not None})
     return MetricSample(ts=from_epoch(row["ts"]), **data)
 
 
@@ -271,6 +287,24 @@ def get_samples(connection_id: int, start: datetime, end: datetime,
             if prev:
                 rows = [prev, *rows]
     return [_row_to_sample(r) for r in rows]
+
+
+def nearest_sample(connection_id: int, at: datetime) -> Optional[MetricSample]:
+    """The sample whose timestamp is closest to `at` (None when there is no history)."""
+    epoch = to_epoch(at)
+    with _db() as db:  # one indexed lookup on each side of `at`
+        before = db.execute(
+            "SELECT * FROM samples WHERE connection_id = ? AND ts <= ? ORDER BY ts DESC LIMIT 1",
+            (connection_id, epoch),
+        ).fetchone()
+        after = db.execute(
+            "SELECT * FROM samples WHERE connection_id = ? AND ts > ? ORDER BY ts LIMIT 1",
+            (connection_id, epoch),
+        ).fetchone()
+    rows = [r for r in (before, after) if r is not None]
+    if not rows:
+        return None
+    return _row_to_sample(min(rows, key=lambda r: abs(r["ts"] - epoch)))
 
 
 def count_samples(connection_id: int, since: Optional[datetime] = None) -> int:

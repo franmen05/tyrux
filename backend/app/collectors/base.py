@@ -29,6 +29,7 @@ class Collector(ABC):
 
     def __init__(self, cfg: ConnectionConfig):
         self.cfg = cfg
+        self.rec_warnings: list[str] = []
 
     # lifecycle — the sampler keeps one collector alive and calls sample() repeatedly;
     # implementations may cache a connection and must reconnect transparently on failure.
@@ -68,4 +69,15 @@ class Collector(ABC):
 
     @abstractmethod
     def recommendations(self) -> list[Recommendation]:
-        """Each Recommendation carries ready-to-run SQL in .sql and a stable .id."""
+        """Each Recommendation carries ready-to-run SQL in .sql and a stable .id.
+
+        Implementations run each analysis section independently: a section that fails or times out
+        is skipped and described in ``self.rec_warnings`` (partial result) instead of failing the
+        whole call. Raise CollectorError only when nothing could be analysed (e.g. no connection).
+        """
+
+    def recommendations_report(self) -> tuple[list[Recommendation], list[str]]:
+        """recommendations() plus the warnings of the sections that failed or were truncated."""
+        self.rec_warnings = []
+        recs = self.recommendations()
+        return recs, list(getattr(self, "rec_warnings", []) or [])

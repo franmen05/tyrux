@@ -1,12 +1,12 @@
 # data-testid reference
 
-Routes: `/connections`, `/charts`, `/technical`, `/optimize` (SPA, BrowserRouter). `/` redirects to `/charts`;
+Routes: `/connections`, `/charts`, `/technical`, `/optimize`, `/compare` (SPA, BrowserRouter). `/` redirects to `/charts`;
 pages other than Conexiones show an empty-state with `goto-connections` when no connection exists.
 
 ## Global (sidebar / layout)
 | testid | Notes |
 |---|---|
-| `nav-connections`, `nav-charts`, `nav-technical`, `nav-optimize` | Sidebar links |
+| `nav-connections`, `nav-charts`, `nav-technical`, `nav-optimize`, `nav-compare` | Sidebar links |
 | `connection-select` | `<select>` of connections (value = id). Persisted in localStorage `dbmonitor.connectionId` |
 | `app-title` / `app-subtitle` | Sidebar brand: "Tyrux" / "DB Monitor" |
 | `engine-badge` | Text "PostgreSQL" / "Oracle" for the selected connection |
@@ -50,6 +50,8 @@ pages other than Conexiones show an empty-state with `goto-connections` when no 
 | `window-5`, `window-15`, `window-60`, `window-360`, `window-1440` | Time window (minutes) buttons |
 | `clear-metrics-btn` | "Borrar historial" (window.confirm dialog) |
 | `chart-sessions`, `chart-tps`, `chart-reads`, `chart-cache`, `chart-longest` | Chart cards (only rendered when there are points) |
+| `longest-query-latest-btn` | "Ver consulta" in `chart-longest` header: opens the query of the latest point with a running query (disabled if none). Clicking any point of `chart-longest` opens the same drawer for that moment |
+| `longest-query-drawer` | Drawer with the longest running query at the chosen moment; inside: `longest-query-meta`, `longest-query-ts`, `longest-query-duration`, `longest-query-sql` (or `longest-query-empty`), `longest-query-copy-btn`, `longest-query-explain-btn` (opens `explain-drawer`) |
 | `chart-top-queries` | Top-10 card (always rendered; `top-queries-empty` inside when no data) |
 | `empty-start-btn` | CTA in the "Inicia el monitoreo para ver la evolución" empty state (focuses the start button) |
 
@@ -83,8 +85,35 @@ pages other than Conexiones show an empty-state with `goto-connections` when no 
 | `recommendation-item` | Card; attrs `data-rec-id`, `data-severity` |
 | `rec-checkbox` | Per item (disabled if the rec has no SQL) |
 | `rec-sql-toggle`, `rec-sql` | Collapsible SQL |
-| `select-all-recs` | Select all |
-| `selected-count` | "N de M seleccionadas" |
+| `select-all-recs` | Select all matching the filters, across all pages (sends `select_all` + `exclude_ids`) |
+| `select-page-recs` | Select / unselect the current page (only when there is more than one page) |
+| `selected-count` | "N de M seleccionadas" (M = recommendations matching the filters) |
+| `rec-filter-severity`, `rec-filter-category`, `rec-search` | Server-side filters (reset to page 1) |
+| `rec-pagination`, `rec-page-prev`, `rec-page-next`, `rec-page-info`, `rec-page-size` | Pagination ("Página X de Y · a–b de N"); page size 25/50/100/200 |
+| `rec-warnings` | Partial result: sections that failed/timed out or were truncated |
+| `rec-refresh-btn` | Recalcular (bypasses the server cache) |
+| `rec-generated-at`, `rec-loading` | When the list was computed / first-load message |
+| `script-truncated` | Shown when the script preview is cut (copy/download keep the full script) |
 | `generate-script-btn` | Disabled until something is selected |
 | `script-output` | `<pre>` with generated script |
 | `copy-script-btn`, `download-script-btn` | Copiar / Descargar .sql (`optimizacion-<engine>.sql`) |
+
+## Comparar índices
+Route `/compare`; does not require the active connection, but needs ≥ 2 connections (else `empty-state` with `goto-connections`).
+| testid | Notes |
+|---|---|
+| `no-exec-notice` | Read-only notice |
+| `compare-source`, `compare-target` | `<select>` origen / destino (value = connection id). Defaults: active connection → first other one |
+| `compare-swap` | Swaps origen and destino |
+| `compare-run-btn` | "Comparar" (disabled when origen = destino; then `compare-same-warning` is shown) |
+| `compare-summary` | Counts line; `compare-count-missing`, `-different`, `-extra`, `-same` |
+| `compare-filter-all`, `-missing`, `-different`, `-extra`, `-same` | Status filter buttons (`aria-pressed`) |
+| `compare-row` | Result row (DataTable: `table-filter`, `th-<key>` also apply) |
+| `compare-status` | Status badge in a row; attr `data-status` = missing / different / extra / same |
+| `compare-checkbox` | Per row; disabled when the row is not copiable (PK, extra, same, untranslatable, table missing in target) |
+| `compare-note`, `compare-sql-toggle`, `compare-sql` | Row detail note and collapsible per-index DDL |
+| `compare-select-all` | "Seleccionar todos" — copiable rows of the current status filter |
+| `compare-selected-count` | "N seleccionados" |
+| `compare-generate-btn` | "Generar SQL" (disabled until something is selected) |
+| `compare-script-output` | `<pre>` with generated script |
+| `compare-copy-btn`, `compare-download-btn` | Copiar / Descargar .sql (`copiar-indices-<engine>.sql`, engine of the target) |

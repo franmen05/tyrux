@@ -39,7 +39,11 @@ class FakeCollector(Collector):
         self._check()
         self.ticks += 1
         return MetricSample(ts=datetime.now(timezone.utc), sessions_active=2, sessions_total=5,
-                            commits=100 * self.ticks, rollbacks=self.ticks)
+                            commits=100 * self.ticks, rollbacks=self.ticks,
+                            longest_query_seconds=1.5 * self.ticks,
+                            longest_query_text=f"select pg_sleep({self.ticks})",
+                            longest_query_id=f"q{self.ticks}", longest_query_user="app",
+                            longest_query_session="4242")
 
     def active_queries(self):
         self._check()

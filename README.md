@@ -57,6 +57,8 @@ Conexiones de ejemplo dentro de la red de compose:
   bloqueos y parámetros de configuración.
 - **Optimización**: recomendaciones por severidad (índices faltantes, sin uso, duplicados,
   estadísticas obsoletas, bloat, configuración) → script SQL para copiar o descargar.
+- **Comparar índices**: compara los índices de dos conexiones (también PostgreSQL ↔ Oracle), marca los que
+  faltan o difieren en el destino y genera el SQL para copiar los seleccionados.
 
 ## Capturas
 

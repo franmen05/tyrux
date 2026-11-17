@@ -10,7 +10,7 @@ from app import store
 from app.api.common import ensure_exists
 from app.metrics import compute_points, downsample, window_top_queries
 from app.sampler import manager
-from app.schemas import MetricSeries, MonitorStart, MonitorStatus, TopQuery
+from app.schemas import LongestQueryAt, MetricSeries, MonitorStart, MonitorStatus, TopQuery
 
 router = APIRouter(prefix="/connections/{connection_id}", tags=["monitor"])
 
@@ -61,6 +61,19 @@ async def metrics(connection_id: int, minutes: float = Query(15, gt=0, le=60 * 2
     return MetricSeries(connection_id=connection_id,
                         interval_seconds=session.interval_seconds if session else None,
                         points=points)
+
+
+@router.get("/metrics/longest-query", response_model=LongestQueryAt)
+async def metrics_longest_query(connection_id: int, at: datetime = Query(...)):
+    """The longest running statement captured by the sample closest to `at` (a chart point)."""
+    await ensure_exists(connection_id)
+    sample = await asyncio.to_thread(store.nearest_sample, connection_id, at)
+    if sample is None:
+        raise HTTPException(404, "No hay muestras para esta conexión")
+    return LongestQueryAt(ts=sample.ts, longest_query_seconds=sample.longest_query_seconds,
+                          query=sample.longest_query_text, query_id=sample.longest_query_id,
+                          username=sample.longest_query_user,
+                          session_id=sample.longest_query_session)
 
 
 @router.get("/metrics/top-queries", response_model=list[TopQuery])

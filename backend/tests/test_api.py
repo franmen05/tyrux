@@ -129,6 +129,13 @@ def test_monitor_lifecycle(client, conn_id):
     top = client.get(f"{base}/metrics/top-queries?minutes=5").json()
     assert top and top[0]["query_id"] == "q1"
 
+    last = pts[-1]
+    lq = client.get(f"{base}/metrics/longest-query", params={"at": last["ts"]}).json()
+    assert lq["longest_query_seconds"] == last["longest_query_seconds"]
+    assert lq["query"].startswith("select pg_sleep(") and lq["username"] == "app"
+    assert lq["session_id"] == "4242"
+    assert client.get(f"{base}/metrics/longest-query").status_code == 422
+
     st = client.delete(f"{base}/monitor").json()
     assert st["running"] is False and st["samples"] >= 3
     assert FakeCollector.instances[0].closed
@@ -136,6 +143,8 @@ def test_monitor_lifecycle(client, conn_id):
 
     assert client.delete(f"{base}/metrics").status_code == 204
     assert client.get(f"{base}/metrics").json()["points"] == []
+    assert client.get(f"{base}/metrics/longest-query",
+                      params={"at": last["ts"]}).status_code == 404
     assert client.post(f"{base}/monitor", json={"interval_seconds": 0.5}).status_code == 422
     assert client.get("/api/connections/999/monitor").status_code == 404
 
@@ -167,3 +176,50 @@ def test_monitor_resumes_after_restart(client, conn_id):
     client.__exit__(None, None, None)  # shutdown keeps the session active
     with TestClient(app) as c2:
         assert c2.get(f"/api/connections/{conn_id}/monitor").json()["running"] is True
+
+
+# ---------------------------------------------------------------- compare indexes
+class _CompareCollector(FakeCollector):
+    """Indexes depend on the connection's database: "shop" = source, anything else = target."""
+
+    def indexes(self):
+        from app.schemas import IndexStat
+        self._check()
+        common = [IndexStat(schema_name="public", table="orders", index="orders_pkey", columns=["id"],
+                            is_unique=True, is_primary=True)]
+        if self.cfg.database == "shop":
+            return common + [IndexStat(schema_name="public", table="orders", index="orders_customer_idx",
+                                       columns=["customer_id"])]
+        return common + [IndexStat(schema_name="public", table="orders", index="orders_extra_idx",
+                                   columns=["status"])]
+
+    def tables(self):
+        from app.schemas import TableStat
+        return [TableStat(schema_name="public", table="orders")]
+
+
+def test_compare_indexes(client, conn_id, monkeypatch):
+    monkeypatch.setattr(collectors, "get_collector", _CompareCollector)
+    target = client.post("/api/connections", json={**PAYLOAD, "name": "qa", "database": "shop_qa"}).json()["id"]
+    body = {"source_id": conn_id, "target_id": target}
+    r = client.post("/api/compare/indexes", json=body)
+    assert r.status_code == 200, r.text
+    data = r.json()
+    assert data["source"]["name"] == "demo" and data["target"]["database"] == "shop_qa"
+    assert data["counts"] == {"missing": 1, "different": 0, "extra": 1, "same": 1}
+    missing = next(i for i in data["items"] if i["status"] == "missing")
+    assert missing["copiable"] and missing["id"] == "src:public.orders_customer_idx"
+
+    r = client.post("/api/compare/indexes/script",
+                    json={**body, "ids": [missing["id"], "dst:public.orders_extra_idx", "nope"]})
+    assert r.status_code == 200
+    script = r.json()
+    assert script["count"] == 1 and script["engine"] == "postgres"
+    assert "CREATE INDEX CONCURRENTLY IF NOT EXISTS orders_customer_idx ON public.orders (customer_id);" \
+        in script["script"]
+
+    assert client.post("/api/compare/indexes", json={"source_id": conn_id, "target_id": conn_id}).status_code == 400
+    assert client.post("/api/compare/indexes", json={"source_id": conn_id, "target_id": 999}).status_code == 404
+    FakeCollector.fail = "conexión rechazada"
+    r = client.post("/api/compare/indexes", json=body)
+    assert r.status_code == 502 and "rechazada" in r.json()["detail"]

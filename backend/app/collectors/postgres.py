@@ -9,6 +9,7 @@ be excluded from pg_stat_statements results.
 """
 from __future__ import annotations
 
+import logging
 import re
 import time
 from datetime import datetime, timezone
@@ -27,12 +28,20 @@ from app.schemas import (
 MARK = "/* dbmon */ "
 APP_NAME = "dbmon"
 DEFAULT_STATEMENT_TIMEOUT_MS = 15000
+LONGEST_QUERY_MAX = 4000  # chars of the longest query kept per sample
 
 SEVERITY_ORDER = {"high": 0, "medium": 1, "low": 2, "info": 3}
 
 # Thresholds used by plan findings and recommendations.
 BIG_TABLE_ROWS = 10_000
 BIG_TABLE_BYTES = 10 * 1024 * 1024
+
+# Recommendations on very large databases: bounded work per section.
+REC_TOP_QUERIES = 20            # top queries whose plans are analysed for missing indexes
+REC_PLAN_BUDGET_S = 20.0        # wall-clock budget for those EXPLAINs
+REC_MAX_TABLE_ROWS = 50_000     # candidate tables (stale stats / bloat / seq scans) analysed
+
+_log = logging.getLogger("dbmon.postgres")
 
 # ------------------------------------------------------------------ identifier quoting
 _RESERVED = {
@@ -377,10 +386,23 @@ class PostgresCollector(Collector):
             return None
         return round(100.0 * hit / (hit + read), 2)
 
+    def _longest_query(self) -> dict:
+        """The statement behind longest_query_seconds (same filters as _SAMPLE_SQL)."""
+        qid = "a.query_id::text" if self.version_num >= 140000 else "NULL::text"
+        return self._q1(f"""
+            SELECT a.pid, a.usename, {qid} AS query_id, left(a.query, {LONGEST_QUERY_MAX}) AS query
+            FROM pg_stat_activity a
+            WHERE a.datname = current_database() AND a.backend_type = 'client backend'
+              AND a.state = 'active' AND a.pid <> pg_backend_pid()
+              AND coalesce(a.application_name, '') <> 'dbmon'
+            ORDER BY a.query_start ASC NULLS LAST
+            LIMIT 1""")
+
     def sample(self) -> MetricSample:
         r = self._q1(self._SAMPLE_SQL)
         hit, read = r.get("blks_hit"), r.get("blks_read")
         lq = r.get("longest_query_seconds")
+        top = self._longest_query() if lq is not None else {}
         return MetricSample(
             ts=datetime.now(timezone.utc),
             sessions_active=r.get("sessions_active") or 0,
@@ -390,6 +412,10 @@ class PostgresCollector(Collector):
             cache_hit_ratio=self._hit_ratio(hit, read),
             size_bytes=r.get("size_bytes"),
             longest_query_seconds=round(float(lq), 3) if lq is not None else None,
+            longest_query_text=top.get("query") or None,
+            longest_query_id=top.get("query_id"),
+            longest_query_user=top.get("usename"),
+            longest_query_session=str(top["pid"]) if top.get("pid") is not None else None,
             commits=r.get("xact_commit"),
             rollbacks=r.get("xact_rollback"),
             physical_reads=read,
@@ -809,15 +835,43 @@ class PostgresCollector(Collector):
         return out
 
     # ================================================================ recommendations
-    def recommendations(self) -> list[Recommendation]:
-        recs: list[Recommendation] = []
-        info = self._pgss()
+    # Each section runs independently (see _rec_section): on a very large database one slow
+    # catalog query (statement_timeout) only drops that section and adds a warning, it does not
+    # fail the whole page. Catalog queries are filtered in SQL so that per-relation functions
+    # (pg_relation_size, pg_get_indexdef...) only run on the candidates, not on every relation.
+    def _rec_section(self, label: str, fn, recs: list[Recommendation], failed: list[str]) -> bool:
+        """Run one section; False when it does not apply (fn returned None)."""
+        try:
+            out = fn()
+            recs.extend(out or [])
+            return out is not None
+        except Exception as exc:  # CollectorError, driver errors, unexpected data
+            if not isinstance(exc, CollectorError):
+                _log.exception("recommendations section %r failed", label)
+            failed.append(label)
+            self.rec_warnings.append(f"{label}: no se pudo completar ({str(exc).rstrip('.')}). "
+                                     "El resto de recomendaciones sí se calculó.")
+            return True
 
-        # --- extension
-        if info.get("error"):
+    def recommendations(self) -> list[Recommendation]:
+        self.rec_warnings = []
+        self._get_conn()   # cannot connect at all -> CollectorError (HTTP 502)
+        recs: list[Recommendation] = []
+        failed: list[str] = []
+        try:
+            info = self._pgss()
+        except CollectorError as exc:
+            info = {"error": "unavailable", "unavailable": True}
+            self.rec_warnings.append(f"pg_stat_statements: no se pudo consultar ({exc}).")
+        top: list[TopQuery] = []
+        plan_tables: set[str] = set()   # qualified names with a plan-derived missing_index rec
+
+        def extension() -> Optional[list[Recommendation]]:
+            if not info.get("error") or info.get("unavailable"):
+                return None
             spl = self._q1("SELECT current_setting('shared_preload_libraries') AS v")["v"] or ""
             loaded = "pg_stat_statements" in spl
-            recs.append(Recommendation(
+            return [Recommendation(
                 id="extension:pg_stat_statements", category="extension", severity="high",
                 title="Habilitar pg_stat_statements",
                 detail=("Sin pg_stat_statements no es posible saber qué consultas consumen más tiempo. "
@@ -832,61 +886,175 @@ class PostgresCollector(Collector):
                     f"-- ALTER SYSTEM SET shared_preload_libraries = '{(spl + ',') if spl else ''}"
                     "pg_stat_statements';")),
                 estimated_benefit="Visibilidad de las consultas más costosas",
+            )]
+
+        def plan_missing() -> Optional[list[Recommendation]]:
+            if info.get("error"):
+                return None
+            top.extend(self.top_queries("total_time", REC_TOP_QUERIES))
+            out = self._plan_missing_index_recs(top)
+            plan_tables.update(r.object_name or "" for r in out)
+            return out
+
+        def table_recs() -> list[Recommendation]:
+            return self._table_recs(plan_tables)
+
+        def index_recs() -> list[Recommendation]:
+            return self._index_recs()
+
+        def slow_queries() -> Optional[list[Recommendation]]:
+            if info.get("error"):
+                return None
+            out = []
+            for tq in (top or self.top_queries("total_time", REC_TOP_QUERIES))[:10]:
+                if tq.mean_time_ms >= 500 and tq.calls >= 2:
+                    short = re.sub(r"\s+", " ", tq.query).strip()
+                    out.append(Recommendation(
+                        id=f"query:{tq.query_id}", category="query",
+                        severity="high" if tq.mean_time_ms >= 2000 else "medium",
+                        title=f"Consulta lenta (media {tq.mean_time_ms / 1000:.2f} s)",
+                        detail=(f"La consulta {tq.query_id} tarda de media {tq.mean_time_ms:,.0f} ms en "
+                                f"{tq.calls:,} ejecuciones ({tq.pct_total_time or 0:.0f}% del tiempo del top). "
+                                "Revise su plan (Explain) para ver por qué es lenta."),
+                        object_name=tq.query_id,
+                        sql=f"-- Revisar el plan de la consulta {tq.query_id}:\n-- "
+                            + (short[:500] + ("…" if len(short) > 500 else "")),
+                        estimated_benefit=f"Hasta {tq.total_time_ms / 1000:,.0f} s de tiempo acumulado",
+                    ))
+            return out
+
+        sections = [
+            ("Extensión pg_stat_statements", extension),
+            ("Índices faltantes (planes de las consultas principales)", plan_missing),
+            ("Tablas (estadísticas, filas muertas, escaneos secuenciales)", table_recs),
+            ("Índices duplicados / sin uso", index_recs),
+            ("Configuración", self._config_recs),
+            ("Consultas lentas", slow_queries),
+        ]
+        applicable = sum(self._rec_section(label, fn, recs, failed) for label, fn in sections)
+        if failed and len(failed) == applicable:
+            raise CollectorError("No se pudo calcular ninguna recomendación: " + " | ".join(self.rec_warnings))
+
+        # de-duplicate ids, sort by severity
+        seen: set[str] = set()
+        uniq = []
+        for r in recs:
+            if r.id not in seen:
+                seen.add(r.id)
+                uniq.append(r)
+        uniq.sort(key=lambda r: SEVERITY_ORDER[r.severity])
+        return uniq
+
+    def _plan_missing_index_recs(self, top: list[TopQuery]) -> list[Recommendation]:
+        """Missing indexes derived from the (generic) plans of the top queries, time-boxed."""
+        cand: dict[tuple[str, str, tuple[str, ...]], dict] = {}
+        relids: dict[tuple[str, str], int] = {}
+        ctx = _PlanContext(self)
+        deadline = time.monotonic() + REC_PLAN_BUDGET_S
+        analysed = 0
+        eligible = [tq for tq in top if tq.total_time_ms > 0]
+        for tq in eligible:
+            if time.monotonic() > deadline:
+                self.rec_warnings.append(
+                    f"Índices faltantes: se analizaron los planes de {analysed} de {len(eligible)} consultas "
+                    f"principales (límite de {REC_PLAN_BUDGET_S:.0f} s alcanzado).")
+                break
+            analysed += 1
+            sql = _clean_statement(tq.query)
+            stripped = _strip_noise(sql)
+            if _first_keyword(stripped) not in ("select", "with", "update", "delete") \
+                    or _is_multi_statement(sql):
+                continue
+            try:
+                doc = self._run_explain(sql, analyze=False, generic=_has_params(sql))
+            except CollectorError:
+                continue
+            for c in ctx.index_candidates(doc.get("Plan", {})):
+                if c["schema"] in ("pg_catalog", "information_schema") or c["schema"].startswith("pg_toast"):
+                    continue   # system catalogs (monitoring queries): indexes cannot be created there
+                key = (c["schema"], c["table"], tuple(c["columns"]))
+                e = cand.setdefault(key, {"time": 0.0, "queries": [], "rows": c["rows"]})
+                e["time"] += tq.total_time_ms
+                e["queries"].append(tq.query_id)
+                if c.get("oid"):
+                    relids[(c["schema"], c["table"])] = int(c["oid"])
+        if not cand:
+            return []
+
+        # existing indexes and scan statistics, only for the candidate tables
+        oids = sorted(set(relids.values()))
+        existing: dict[int, list[list[str]]] = {}
+        for r in self._q("""
+            SELECT i.indrelid,
+                   ARRAY(SELECT pg_get_indexdef(i.indexrelid, k, true)
+                         FROM generate_series(1, i.indnkeyatts) AS k ORDER BY k) AS columns
+            FROM pg_index i WHERE i.indrelid = ANY(%s::oid[])
+        """, (oids,)):
+            existing.setdefault(r["indrelid"], []).append(list(r["columns"] or []))
+        stats = {r["relid"]: r for r in self._q(
+            "SELECT relid, seq_scan, seq_tup_read FROM pg_stat_user_tables WHERE relid = ANY(%s::oid[])",
+            (oids,))}
+
+        def covered(oid: Optional[int], cols: list[str]) -> bool:
+            for ic in existing.get(oid, []):
+                if ic[:len(cols)] == cols or (ic and ic[0] == cols[0] and len(cols) == 1):
+                    return True
+            return False
+
+        recs = []
+        for (schema, table, cols), e in sorted(cand.items(), key=lambda kv: -kv[1]["time"]):
+            cols_l = list(cols)
+            oid = relids.get((schema, table))
+            if covered(oid, cols_l):
+                continue
+            t = stats.get(oid, {})
+            q = qualified(schema, table)
+            idx = index_name_for(table, cols_l)
+            seq_reads = int(t.get("seq_tup_read") or 0)
+            recs.append(Recommendation(
+                id=f"missing_index:{schema}.{table}({','.join(cols_l)})", category="missing_index",
+                severity="high" if e["time"] >= 10_000 or seq_reads >= 10_000_000 else "medium",
+                title=f"Falta índice en {table} ({', '.join(cols_l)})",
+                detail=(f"{len(e['queries'])} consulta(s) del top recorren la tabla completa {q} "
+                        f"(≈{int(e['rows'] or 0):,} filas) filtrando por {', '.join(cols_l)}. Tiempo acumulado "
+                        f"de esas consultas: {e['time'] / 1000:,.1f} s. Escaneos secuenciales en la tabla: "
+                        f"{int(t.get('seq_scan') or 0):,} ({seq_reads:,} filas leídas). "
+                        f"Consultas: {', '.join(e['queries'][:5])}."),
+                object_name=q,
+                sql=(f"CREATE INDEX CONCURRENTLY IF NOT EXISTS {quote_ident(idx)}\n"
+                     f"    ON {q} ({', '.join(quote_ident(c) for c in cols_l)});"),
+                estimated_benefit="Sustituye escaneos completos por búsquedas por índice",
             ))
+        return recs
 
-        tables = {(t["schemaname"], t["relname"]): t for t in self._q("""
-            SELECT s.schemaname, s.relname, s.relid, s.seq_scan, s.seq_tup_read, coalesce(s.idx_scan, 0) AS idx_scan,
-                   s.n_live_tup, s.n_dead_tup, s.n_mod_since_analyze,
-                   CASE WHEN c.reltuples < 0 THEN s.n_live_tup ELSE c.reltuples::bigint END AS rows_est,
-                   pg_relation_size(s.relid) AS size_bytes,
-                   greatest(s.last_analyze, s.last_autoanalyze) AS last_analyzed,
-                   c.reloptions
-            FROM pg_stat_user_tables s JOIN pg_class c ON c.oid = s.relid
-        """)}
-        idx_rows = self._index_rows()
-        dup = self._find_duplicates(idx_rows)
-        stats_reset = self._q1(
-            "SELECT stats_reset FROM pg_stat_database WHERE datname = current_database()").get("stats_reset")
-        since = (f" desde el último reinicio de estadísticas ({stats_reset:%Y-%m-%d %H:%M})"
-                 if stats_reset else " desde que se crearon las estadísticas")
-
-        # --- missing indexes (from plans of top queries + table scan statistics)
-        recs.extend(self._missing_index_recs(info, tables, idx_rows))
-
-        # --- duplicate / unused indexes
-        keepers = set(dup.values())   # indexes that make a duplicate redundant: never suggest dropping
-        for r in idx_rows:
-            name = qualified(r["schemaname"], r["indexrelname"])
-            size = _fmt_bytes(r["size_bytes"])
-            if r["indexrelid"] in dup:
-                recs.append(Recommendation(
-                    id=f"duplicate_index:{r['schemaname']}.{r['indexrelname']}", category="duplicate_index",
-                    severity="medium",
-                    title=f"Índice duplicado {r['indexrelname']}",
-                    detail=(f"El índice {name} ({', '.join(r['columns'])}) es redundante con "
-                            f"{dup[r['indexrelid']]}, que cubre las mismas columnas iniciales. Ocupa {size} y "
-                            "ralentiza las escrituras sin aportar a las lecturas."),
-                    object_name=name,
-                    sql=f"DROP INDEX CONCURRENTLY IF EXISTS {name};",
-                    estimated_benefit=f"Libera {size} y abarata INSERT/UPDATE",
-                ))
-            elif r["idx_scan"] == 0 and not r["indisunique"] and not r["indisprimary"] \
-                    and not r["backs_constraint"] and name not in keepers:
-                big = (r["size_bytes"] or 0) >= BIG_TABLE_BYTES
-                recs.append(Recommendation(
-                    id=f"unused_index:{r['schemaname']}.{r['indexrelname']}", category="unused_index",
-                    severity="medium" if big else "low",
-                    title=f"Índice sin uso {r['indexrelname']}",
-                    detail=(f"El índice {name} sobre {r['relname']} ({', '.join(r['columns'])}) no se ha usado "
-                            f"nunca{since}. Ocupa {size}. Antes de eliminarlo compruebe que tampoco se usa en "
-                            "réplicas ni en procesos periódicos (cierres de mes, informes)."),
-                    object_name=name,
-                    sql=f"DROP INDEX CONCURRENTLY IF EXISTS {name};",
-                    estimated_benefit=f"Libera {size} y abarata INSERT/UPDATE",
-                ))
-
-        # --- stale stats / bloat
-        for (schema, table), t in tables.items():
+    def _table_recs(self, tables_with_rec: set[str]) -> list[Recommendation]:
+        """Stale statistics, bloat and heavy sequential scans. The WHERE keeps only tables that can
+        trigger one of them, so pg_relation_size runs on those candidates only (not on every table)."""
+        rows = self._q(f"""
+            WITH t AS MATERIALIZED (
+                SELECT s.schemaname, s.relname, s.relid, s.seq_scan, s.seq_tup_read,
+                       coalesce(s.idx_scan, 0) AS idx_scan, s.n_live_tup, s.n_dead_tup, s.n_mod_since_analyze,
+                       CASE WHEN c.reltuples < 0 THEN s.n_live_tup ELSE c.reltuples::bigint END AS rows_est,
+                       greatest(s.last_analyze, s.last_autoanalyze) AS last_analyzed,
+                       c.reloptions
+                FROM pg_stat_user_tables s JOIN pg_class c ON c.oid = s.relid
+                WHERE s.n_dead_tup > 10000
+                   OR s.n_mod_since_analyze >= 1000
+                   OR (s.last_analyze IS NULL AND s.last_autoanalyze IS NULL
+                       AND greatest(c.reltuples, s.n_live_tup) >= 1000)
+                   OR (s.seq_scan >= 50 AND s.seq_tup_read >= 1000000)
+            )
+            SELECT t.*, pg_relation_size(t.relid) AS size_bytes FROM t
+            ORDER BY t.schemaname, t.relname
+            LIMIT {REC_MAX_TABLE_ROWS + 1}
+        """)
+        if len(rows) > REC_MAX_TABLE_ROWS:
+            rows = rows[:REC_MAX_TABLE_ROWS]
+            self.rec_warnings.append(f"Tablas: se analizaron solo las primeras {REC_MAX_TABLE_ROWS:,} tablas "
+                                     "candidatas (estadísticas, filas muertas o escaneos secuenciales).")
+        recs: list[Recommendation] = []
+        for t in rows:
+            schema, table = t["schemaname"], t["relname"]
             q = qualified(schema, table)
             rows_est = max(int(t["rows_est"] or 0), int(t["n_live_tup"] or 0))
             mods = int(t["n_mod_since_analyze"] or 0)
@@ -921,121 +1089,96 @@ class PostgresCollector(Collector):
                     title=f"Filas muertas en {table}", detail=detail, object_name=q, sql=sql,
                     estimated_benefit="Menos páginas leídas por escaneo",
                 ))
-
-        # --- config
-        recs.extend(self._config_recs())
-
-        # --- slow queries
-        if not info.get("error"):
-            for tq in self.top_queries("total_time", 10):
-                if tq.mean_time_ms >= 500 and tq.calls >= 2:
-                    short = re.sub(r"\s+", " ", tq.query).strip()
-                    recs.append(Recommendation(
-                        id=f"query:{tq.query_id}", category="query",
-                        severity="high" if tq.mean_time_ms >= 2000 else "medium",
-                        title=f"Consulta lenta (media {tq.mean_time_ms / 1000:.2f} s)",
-                        detail=(f"La consulta {tq.query_id} tarda de media {tq.mean_time_ms:,.0f} ms en "
-                                f"{tq.calls:,} ejecuciones ({tq.pct_total_time or 0:.0f}% del tiempo del top). "
-                                "Revise su plan (Explain) para ver por qué es lenta."),
-                        object_name=tq.query_id,
-                        sql=f"-- Revisar el plan de la consulta {tq.query_id}:\n-- "
-                            + (short[:500] + ("…" if len(short) > 500 else "")),
-                        estimated_benefit=f"Hasta {tq.total_time_ms / 1000:,.0f} s de tiempo acumulado",
-                    ))
-
-        # de-duplicate ids, sort by severity
-        seen: set[str] = set()
-        uniq = []
-        for r in recs:
-            if r.id not in seen:
-                seen.add(r.id)
-                uniq.append(r)
-        uniq.sort(key=lambda r: SEVERITY_ORDER[r.severity])
-        return uniq
-
-    def _missing_index_recs(self, info: dict, tables: dict, idx_rows: list[dict]) -> list[Recommendation]:
-        existing: dict[tuple[str, str], list[list[str]]] = {}
-        for r in idx_rows:
-            existing.setdefault((r["schemaname"], r["relname"]), []).append(list(r["columns"]))
-
-        def covered(schema: str, table: str, cols: list[str]) -> bool:
-            for ic in existing.get((schema, table), []):
-                if ic[:len(cols)] == cols or (ic and ic[0] == cols[0] and len(cols) == 1):
-                    return True
-            return False
-
-        # candidates from the plans of the top queries
-        cand: dict[tuple[str, str, tuple[str, ...]], dict] = {}
-        if not info.get("error"):
-            ctx = _PlanContext(self)
-            for tq in self.top_queries("total_time", 20):
-                if tq.total_time_ms <= 0:
-                    continue
-                sql = _clean_statement(tq.query)
-                stripped = _strip_noise(sql)
-                if _first_keyword(stripped) not in ("select", "with", "update", "delete") \
-                        or _is_multi_statement(sql):
-                    continue
-                params = _has_params(sql)
-                try:
-                    doc = self._run_explain(sql, analyze=False, generic=params)
-                except CollectorError:
-                    continue
-                for c in ctx.index_candidates(doc.get("Plan", {})):
-                    key = (c["schema"], c["table"], tuple(c["columns"]))
-                    e = cand.setdefault(key, {"time": 0.0, "queries": [], "rows": c["rows"]})
-                    e["time"] += tq.total_time_ms
-                    e["queries"].append(tq.query_id)
-
-        recs = []
-        tables_with_rec: set[tuple[str, str]] = set()
-        for (schema, table, cols), e in sorted(cand.items(), key=lambda kv: -kv[1]["time"]):
-            cols_l = list(cols)
-            if covered(schema, table, cols_l):
-                continue
-            t = tables.get((schema, table), {})
-            q = qualified(schema, table)
-            idx = index_name_for(table, cols_l)
-            seq_reads = int(t.get("seq_tup_read") or 0)
-            recs.append(Recommendation(
-                id=f"missing_index:{schema}.{table}({','.join(cols_l)})", category="missing_index",
-                severity="high" if e["time"] >= 10_000 or seq_reads >= 10_000_000 else "medium",
-                title=f"Falta índice en {table} ({', '.join(cols_l)})",
-                detail=(f"{len(e['queries'])} consulta(s) del top recorren la tabla completa {q} "
-                        f"(≈{int(e['rows'] or 0):,} filas) filtrando por {', '.join(cols_l)}. Tiempo acumulado "
-                        f"de esas consultas: {e['time'] / 1000:,.1f} s. Escaneos secuenciales en la tabla: "
-                        f"{int(t.get('seq_scan') or 0):,} ({seq_reads:,} filas leídas). "
-                        f"Consultas: {', '.join(e['queries'][:5])}."),
-                object_name=q,
-                sql=(f"CREATE INDEX CONCURRENTLY IF NOT EXISTS {quote_ident(idx)}\n"
-                     f"    ON {q} ({', '.join(quote_ident(c) for c in cols_l)});"),
-                estimated_benefit="Sustituye escaneos completos por búsquedas por índice",
-            ))
-            tables_with_rec.add((schema, table))
-
-        # tables with heavy sequential scans but no plan-derived columns
-        for (schema, table), t in tables.items():
-            if (schema, table) in tables_with_rec:
+            # heavy sequential scans without a plan-derived column
+            if q in tables_with_rec:
                 continue
             seq, seq_read, idx = int(t["seq_scan"] or 0), int(t["seq_tup_read"] or 0), int(t["idx_scan"] or 0)
-            rows_est = int(t["rows_est"] or 0)
-            big = (t["size_bytes"] or 0) >= BIG_TABLE_BYTES or rows_est >= BIG_TABLE_ROWS
+            big = (t["size_bytes"] or 0) >= BIG_TABLE_BYTES or int(t["rows_est"] or 0) >= BIG_TABLE_ROWS
             if not big or seq < 50 or seq_read < 1_000_000 or seq_read / max(seq, 1) < BIG_TABLE_ROWS:
                 continue
-            q = qualified(schema, table)
             recs.append(Recommendation(
                 id=f"missing_index:{schema}.{table}", category="missing_index",
                 severity="low",
                 title=f"Muchos escaneos secuenciales en {table}",
-                detail=(f"La tabla {q} ({rows_est:,} filas, {_fmt_bytes(t['size_bytes'])}) se ha recorrido "
-                        f"completa {seq:,} veces ({seq_read:,} filas leídas) frente a {idx:,} accesos por índice. "
-                        "No se pudo determinar automáticamente la columna filtrada: revise con Explain las "
-                        "consultas que usan esta tabla y cree un índice sobre las columnas del WHERE."),
+                detail=(f"La tabla {q} ({int(t['rows_est'] or 0):,} filas, {_fmt_bytes(t['size_bytes'])}) se ha "
+                        f"recorrido completa {seq:,} veces ({seq_read:,} filas leídas) frente a {idx:,} accesos "
+                        "por índice. No se pudo determinar automáticamente la columna filtrada: revise con "
+                        "Explain las consultas que usan esta tabla y cree un índice sobre las columnas del WHERE."),
                 object_name=q,
                 sql=(f"-- Revise las consultas sobre {q} y cree un índice sobre las columnas filtradas, p. ej.:\n"
                      f"-- CREATE INDEX CONCURRENTLY IF NOT EXISTS {quote_ident(table + '_col_idx')} ON {q} (columna);"),
                 estimated_benefit="Sustituye escaneos completos por búsquedas por índice",
             ))
+        return recs
+
+    def _index_recs(self) -> list[Recommendation]:
+        """Duplicate and unused indexes. Only indexes that can be either (tables with 2+ indexes, or
+        never scanned and not unique) are read; sizes are fetched afterwards for the flagged ones."""
+        rows = self._q("""
+            SELECT s.schemaname, s.relname, s.indexrelname, s.indexrelid, s.relid, s.idx_scan,
+                   i.indisunique, i.indisprimary,
+                   ARRAY(SELECT pg_get_indexdef(s.indexrelid, k, true)
+                         FROM generate_series(1, i.indnkeyatts) AS k ORDER BY k) AS columns,
+                   pg_get_expr(i.indpred, i.indrelid) AS predicate,
+                   am.amname,
+                   EXISTS (SELECT 1 FROM pg_constraint co WHERE co.conindid = s.indexrelid) AS backs_constraint
+            FROM pg_stat_user_indexes s
+            JOIN pg_index i ON i.indexrelid = s.indexrelid
+            JOIN pg_class ic ON ic.oid = s.indexrelid
+            JOIN pg_am am ON am.oid = ic.relam
+            WHERE i.indrelid IN (SELECT indrelid FROM pg_index GROUP BY indrelid HAVING count(*) > 1)
+               OR (s.idx_scan = 0 AND NOT i.indisunique AND NOT i.indisprimary)
+        """)
+        rows.sort(key=lambda r: (r["schemaname"], r["relname"], r["indexrelname"]))
+        dup = self._find_duplicates(rows)
+        stats_reset = self._q1(
+            "SELECT stats_reset FROM pg_stat_database WHERE datname = current_database()").get("stats_reset")
+        since = (f" desde el último reinicio de estadísticas ({stats_reset:%Y-%m-%d %H:%M})"
+                 if stats_reset else " desde que se crearon las estadísticas")
+        keepers = set(dup.values())   # indexes that make a duplicate redundant: never suggest dropping
+        flagged = []
+        for r in rows:
+            name = qualified(r["schemaname"], r["indexrelname"])
+            if r["indexrelid"] in dup:
+                flagged.append(("dup", r, name))
+            elif r["idx_scan"] == 0 and not r["indisunique"] and not r["indisprimary"] \
+                    and not r["backs_constraint"] and name not in keepers:
+                flagged.append(("unused", r, name))
+        sizes: dict[int, Optional[int]] = {}
+        oids = [r["indexrelid"] for _, r, _ in flagged]
+        for i in range(0, len(oids), 5000):
+            for x in self._q("SELECT o AS oid, pg_relation_size(o) AS size_bytes FROM unnest(%s::oid[]) AS o",
+                             (oids[i:i + 5000],)):
+                sizes[x["oid"]] = x["size_bytes"]
+        recs = []
+        for kind, r, name in flagged:
+            size_bytes = sizes.get(r["indexrelid"])
+            size = _fmt_bytes(size_bytes)
+            if kind == "dup":
+                recs.append(Recommendation(
+                    id=f"duplicate_index:{r['schemaname']}.{r['indexrelname']}", category="duplicate_index",
+                    severity="medium",
+                    title=f"Índice duplicado {r['indexrelname']}",
+                    detail=(f"El índice {name} ({', '.join(r['columns'])}) es redundante con "
+                            f"{dup[r['indexrelid']]}, que cubre las mismas columnas iniciales. Ocupa {size} y "
+                            "ralentiza las escrituras sin aportar a las lecturas."),
+                    object_name=name,
+                    sql=f"DROP INDEX CONCURRENTLY IF EXISTS {name};",
+                    estimated_benefit=f"Libera {size} y abarata INSERT/UPDATE",
+                ))
+            else:
+                big = (size_bytes or 0) >= BIG_TABLE_BYTES
+                recs.append(Recommendation(
+                    id=f"unused_index:{r['schemaname']}.{r['indexrelname']}", category="unused_index",
+                    severity="medium" if big else "low",
+                    title=f"Índice sin uso {r['indexrelname']}",
+                    detail=(f"El índice {name} sobre {r['relname']} ({', '.join(r['columns'])}) no se ha usado "
+                            f"nunca{since}. Ocupa {size}. Antes de eliminarlo compruebe que tampoco se usa en "
+                            "réplicas ni en procesos periódicos (cierres de mes, informes)."),
+                    object_name=name,
+                    sql=f"DROP INDEX CONCURRENTLY IF EXISTS {name};",
+                    estimated_benefit=f"Libera {size} y abarata INSERT/UPDATE",
+                ))
         return recs
 
     def _config_recs(self) -> list[Recommendation]:
@@ -1170,7 +1313,7 @@ class _PlanContext:
             cols = self.filter_columns(node["Filter"], list(info.get("columns") or []))[:3]
             if not cols:
                 continue
-            out.append({"schema": info["nspname"], "table": info["relname"], "columns": cols,
+            out.append({"schema": info["nspname"], "table": info["relname"], "columns": cols, "oid": info.get("oid"),
                         "rows": rows, "filter": node["Filter"], "node": node,
                         "has_lead_index": cols[0] in (info.get("index_lead") or [])})
         return out

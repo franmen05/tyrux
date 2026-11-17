@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from fastapi import APIRouter, Query
 
+from app import rec_cache
 from app.api.common import collect, load_config
 from app.collectors.base import OrderBy
 from app.metrics import with_pct
@@ -59,5 +60,8 @@ async def config(connection_id: int):
 
 
 @router.get("/recommendations", response_model=list[Recommendation])
-async def recommendations(connection_id: int):
-    return await collect(await load_config(connection_id), "recommendations")
+async def recommendations(connection_id: int, refresh: bool = False):
+    """Full list (unpaginated, kept for compatibility). The Optimización page uses
+    /recommendations/page; both share the per-connection cache of app.rec_cache."""
+    snap = await rec_cache.get_snapshot(await load_config(connection_id), refresh=refresh)
+    return snap.recs

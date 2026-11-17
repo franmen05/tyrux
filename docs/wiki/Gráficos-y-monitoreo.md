@@ -25,7 +25,13 @@ Con la **ventana de tiempo** (5 min, 15 min, 1 h, 6 h, 24 h):
 - Transacciones por segundo (commits y rollbacks).
 - Lecturas lógicas y físicas por segundo.
 - Cache hit (%).
+- Consulta más larga (s): duración de la consulta en curso más antigua en cada muestra. **Haz clic en un punto** para ver
+  la consulta que se estaba ejecutando en ese momento (SQL, duración, usuario y sesión), copiarla o analizar su plan;
+  el botón **Ver consulta** de la tarjeta abre la del punto más reciente. Se guardan hasta 4000 caracteres del SQL por
+  muestra; las muestras tomadas antes de esta versión no tienen texto.
 - Top consultas del periodo: qué consultas acumularon más tiempo entre las muestras.
+
+![Consulta más larga en un momento](https://raw.githubusercontent.com/franmen05/tyrux/main/docs/images/charts-longest-query.png)
 
 Funciona igual con Oracle:
 
