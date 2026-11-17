@@ -40,11 +40,11 @@ test.describe('Manejo de errores', () => {
   })
 
   test('error 500 genérico del backend no deja la página en blanco', async ({ page }) => {
-    await page.route('**/api/connections/1/recommendations', (r) => r.fulfill({ status: 500, json: { detail: 'boom-e2e' } }))
+    await page.route('**/api/connections/1/recommendations/page?**', (r) => r.fulfill({ status: 500, json: { detail: 'boom-e2e' } }))
     await page.goto('/optimize')
     await expect(page.getByTestId('error-banner')).toContainText('boom-e2e')
     await expect(page.getByTestId('retry-btn')).toBeVisible()
-    await page.unroute('**/api/connections/1/recommendations')
+    await page.unroute('**/api/connections/1/recommendations/page?**')
     await page.getByTestId('retry-btn').click()
     await expect(page.getByTestId('recommendation-item').first()).toBeVisible()
   })

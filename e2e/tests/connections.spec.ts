@@ -150,6 +150,8 @@ test.describe('Conexiones', () => {
   })
 
   test('Cancelar cierra el formulario sin crear nada', async ({ page }) => {
+    await expect(page.getByTestId('connection-row').first()).toBeVisible()
+    await page.waitForLoadState('networkidle')
     const before = await page.getByTestId('connection-row').count()
     await page.getByTestId('add-connection-btn').click()
     await page.getByTestId('conn-name').fill('e2e-no-guardar')
